@@ -102,6 +102,156 @@ struct ProcessResult: Sendable {
     var output: String
 }
 
+struct DownloadProgressSnapshot: Equatable, Sendable {
+    var hasActivity = false
+    var isActive = false
+    var databaseNames: [String] = []
+    var startedAt: Date?
+    var lastUpdated: Date?
+    var expectedCompressedBytes: Int64?
+    var observedCompressedBytes: Int64 = 0
+    var addedCompressedBytes: Int64 = 0
+    var archiveCount = 0
+    var verifiedArchiveCount = 0
+    var matchingFileCount = 0
+    var activeDatabaseName = ""
+    var activeFileName = ""
+    var activeFileBytes: Int64 = 0
+    var status = "Idle"
+
+    var fractionComplete: Double? {
+        guard let expectedCompressedBytes, expectedCompressedBytes > 0 else { return nil }
+        return min(max(Double(observedCompressedBytes) / Double(expectedCompressedBytes), 0), 1)
+    }
+
+    var remainingCompressedBytes: Int64? {
+        guard let expectedCompressedBytes else { return nil }
+        return max(expectedCompressedBytes - observedCompressedBytes, 0)
+    }
+
+    var elapsed: TimeInterval {
+        guard let startedAt else { return 0 }
+        return Date().timeIntervalSince(startedAt)
+    }
+
+    var bytesPerSecond: Double {
+        guard elapsed > 0 else { return 0 }
+        return Double(addedCompressedBytes) / elapsed
+    }
+
+    var estimatedTimeRemaining: TimeInterval? {
+        guard let remainingCompressedBytes, bytesPerSecond > 1 else { return nil }
+        return Double(remainingCompressedBytes) / bytesPerSecond
+    }
+
+    var estimatedFinishDate: Date? {
+        guard let estimatedTimeRemaining else { return nil }
+        return Date().addingTimeInterval(estimatedTimeRemaining)
+    }
+}
+
+private struct DownloadDirectoryScan: Equatable, Sendable {
+    var observedCompressedBytes: Int64 = 0
+    var archiveCount = 0
+    var verifiedArchiveCount = 0
+    var matchingFileCount = 0
+    var activeDatabaseName = ""
+    var activeFileName = ""
+    var activeFileBytes: Int64 = 0
+    var lastModified: Date?
+}
+
+private struct DownloadArchiveInfo: Sendable {
+    var databaseName: String
+    var fileName: String
+    var byteSize: Int64
+    var modifiedAt: Date
+}
+
+private enum DownloadDirectoryScanner {
+    static func scan(directory: String, databaseNames: [String]) -> DownloadDirectoryScan {
+        let fileManager = FileManager.default
+        let url = URL(fileURLWithPath: directory, isDirectory: true)
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+        guard let urls = try? fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: Array(keys)) else {
+            return DownloadDirectoryScan()
+        }
+
+        let sortedNames = databaseNames.sorted { $0.count > $1.count }
+        var archives: [DownloadArchiveInfo] = []
+        var md5Files = Set<String>()
+        var matchingFileCount = 0
+        var lastModified: Date?
+
+        for fileURL in urls {
+            let fileName = fileURL.lastPathComponent
+            guard let databaseName = matchingDatabaseName(for: fileName, databaseNames: sortedNames) else {
+                continue
+            }
+
+            let values = try? fileURL.resourceValues(forKeys: keys)
+            guard values?.isRegularFile != false else { continue }
+            matchingFileCount += 1
+
+            let modifiedAt = values?.contentModificationDate ?? .distantPast
+            if lastModified == nil || modifiedAt > lastModified! {
+                lastModified = modifiedAt
+            }
+
+            if fileName.hasSuffix(".tar.gz") {
+                archives.append(
+                    DownloadArchiveInfo(
+                        databaseName: databaseName,
+                        fileName: fileName,
+                        byteSize: Int64(values?.fileSize ?? 0),
+                        modifiedAt: modifiedAt
+                    )
+                )
+            } else if fileName.hasSuffix(".tar.gz.md5") {
+                md5Files.insert(String(fileName.dropLast(4)))
+            }
+        }
+
+        let activeArchive = archives
+            .filter { !md5Files.contains($0.fileName) }
+            .max { $0.modifiedAt < $1.modifiedAt }
+            ?? archives.max { $0.modifiedAt < $1.modifiedAt }
+
+        return DownloadDirectoryScan(
+            observedCompressedBytes: archives.reduce(Int64(0)) { $0 + $1.byteSize },
+            archiveCount: archives.count,
+            verifiedArchiveCount: archives.filter { md5Files.contains($0.fileName) }.count,
+            matchingFileCount: matchingFileCount,
+            activeDatabaseName: activeArchive?.databaseName ?? "",
+            activeFileName: activeArchive?.fileName ?? "",
+            activeFileBytes: activeArchive?.byteSize ?? 0,
+            lastModified: lastModified
+        )
+    }
+
+    private static func matchingDatabaseName(for fileName: String, databaseNames: [String]) -> String? {
+        databaseNames.first { name in
+            fileName == name || fileName.hasPrefix("\(name).")
+        }
+    }
+}
+
+private struct BlastDatabaseMetadataRecord: Decodable {
+    var dbname: String
+    var bytesTotal: Int64?
+    var files: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case dbname
+        case bytesTotal = "bytes-total"
+        case files
+    }
+}
+
+private let clusteredNRMetadataURL = URL(
+    string: "https://ftp.ncbi.nlm.nih.gov/blast/db/v5/v5/experimental/nr_cluster_seq-prot-metadata.json"
+)
+
 final class PipeOutputBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var data = Data()
@@ -274,6 +424,7 @@ final class AppModel: ObservableObject {
     @Published var isRunningSearch = false
     @Published var isRefreshingCatalog = false
     @Published var isDownloading = false
+    @Published var downloadProgress = DownloadProgressSnapshot()
     @Published var toolStatuses: [ToolStatus] = []
     @Published var jobs: [BlastJobRecord] = []
     @Published var customDatabaseInput = ""
@@ -281,12 +432,17 @@ final class AppModel: ObservableObject {
     @Published var customDatabaseType = "nucl"
     @Published var customDatabaseParseSeqIDs = true
 
+    private var downloadProgressTask: Task<Void, Never>?
+    private var downloadProgressBaseline = DownloadDirectoryScan()
+    private var downloadProgressDirectory = ""
+    private var downloadProgressNames: [String] = []
+
     init() {
         let preferences = BlastPreferences.load()
         self.preferences = preferences
         self.configuration = BlastSearchConfiguration(
             program: .blastn,
-            databaseName: "nt",
+            databaseName: RecommendedBlastDatabases.blastn,
             databaseDirectory: preferences.databaseDirectory
         )
         ensureDefaultOutputPath()
@@ -324,7 +480,9 @@ final class AppModel: ObservableObject {
     func setProgram(_ program: BlastProgram) {
         configuration.program = program
         configuration.resetOptionsForProgram()
-        if let matchingDatabase = databaseCatalog.first(where: { $0.kind == program.databaseKind && $0.isInstalled }) ??
+        if let recommendedDatabaseName = program.recommendedDatabaseName {
+            configuration.databaseName = recommendedDatabaseName
+        } else if let matchingDatabase = databaseCatalog.first(where: { $0.kind == program.databaseKind && $0.isInstalled }) ??
             databaseCatalog.first(where: { $0.kind == program.databaseKind }) {
             configuration.databaseName = matchingDatabase.name
         }
@@ -388,7 +546,7 @@ final class AppModel: ObservableObject {
             if parsed.isEmpty {
                 databaseLog = "update_blastdb.pl --showall returned no database names. Keeping the starter catalog.\n\n\(result.output)"
             } else {
-                databaseCatalog = parsed
+                databaseCatalog = BlastDatabaseParser.includingRecommended(parsed)
                 databaseLog = "Loaded \(parsed.count) downloadable databases from update_blastdb.pl --showall."
             }
             markInstalledDatabases()
@@ -401,7 +559,16 @@ final class AppModel: ObservableObject {
     func markInstalledDatabases() {
         let summary = InstalledBlastDatabaseScanner.summary(directory: URL(fileURLWithPath: preferences.databaseDirectory))
         installedDatabaseSummary = summary
-        databaseCatalog = BlastDatabaseParser.markInstalled(databaseCatalog, installedNames: summary.names)
+        databaseCatalog = BlastDatabaseParser.markInstalled(
+            BlastDatabaseParser.includingRecommended(databaseCatalog),
+            installedNames: summary.names
+        )
+    }
+
+    func selectRecommendedStarterDatabases() {
+        for name in RecommendedBlastDatabases.starterNames {
+            selectedDatabaseNames.insert(name)
+        }
     }
 
     func downloadSelectedDatabases() async {
@@ -409,16 +576,75 @@ final class AppModel: ObservableObject {
             databaseLog = LocalBlastError.emptyDownloadSelection.localizedDescription
             return
         }
-        guard let updater = ProcessClient.resolveExecutable(named: "update_blastdb.pl", preferences: preferences) else {
+
+        ensureWorkingDirectories()
+        let names = selectedDatabaseNames.sorted()
+        let directDownloadNames = names.filter { $0 == RecommendedBlastDatabases.blastp }
+        let updaterNames = names.filter { !directDownloadNames.contains($0) }
+        let updater = ProcessClient.resolveExecutable(named: "update_blastdb.pl", preferences: preferences)
+        if !updaterNames.isEmpty, updater == nil {
             databaseLog = LocalBlastError.toolMissing("update_blastdb.pl").localizedDescription
             return
         }
 
-        ensureWorkingDirectories()
+        let databaseDirectory = preferences.databaseDirectory
+        databaseLog = "Preparing download: \(names.joined(separator: ", "))"
+        let expectedCompressedBytes = await fetchExpectedCompressedBytes(for: names)
+
         isDownloading = true
+        startDownloadProgress(
+            names: names,
+            directory: databaseDirectory,
+            expectedCompressedBytes: expectedCompressedBytes
+        )
         defer { isDownloading = false }
 
-        let names = selectedDatabaseNames.sorted()
+        databaseLog = "Starting download: \(names.joined(separator: ", "))"
+
+        do {
+            var outputs: [String] = []
+            var exitCode: Int32 = 0
+
+            if !updaterNames.isEmpty, let updater {
+                let result = try await runUpdateBlastDatabaseDownload(
+                    updater: updater,
+                    names: updaterNames,
+                    databaseDirectory: databaseDirectory
+                )
+                exitCode = result.exitCode
+                if !result.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    outputs.append(result.output)
+                }
+            }
+
+            if directDownloadNames.contains(RecommendedBlastDatabases.blastp), exitCode == 0 {
+                databaseLog = "Downloading ClusteredNR directly from NCBI experimental metadata."
+                let result = try await downloadClusteredNRDatabase(
+                    databaseDirectory: databaseDirectory,
+                    decompress: preferences.decompressDownloads
+                )
+                exitCode = result.exitCode
+                if !result.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    outputs.append(result.output)
+                }
+            }
+
+            markInstalledDatabases()
+            databaseLog = outputs.isEmpty
+                ? "Download finished with exit code \(exitCode)."
+                : outputs.joined(separator: "\n\n")
+            finishDownloadProgress(exitCode: exitCode)
+        } catch {
+            databaseLog = "Download failed: \(error.localizedDescription)"
+            finishDownloadProgress(exitCode: nil, failureMessage: error.localizedDescription)
+        }
+    }
+
+    private func runUpdateBlastDatabaseDownload(
+        updater: URL,
+        names: [String],
+        databaseDirectory: String
+    ) async throws -> ProcessResult {
         var arguments: [String] = []
         if preferences.decompressDownloads {
             arguments.append("--decompress")
@@ -427,44 +653,261 @@ final class AppModel: ObservableObject {
             arguments.append(contentsOf: ["--blastdb_version", "5"])
         }
         arguments.append(contentsOf: names)
-        databaseLog = "Starting download: \(names.joined(separator: ", "))"
-        let databaseDirectory = preferences.databaseDirectory
 
-        do {
-            let result = try await Task.detached {
+        let result = try await Task.detached {
+            try ProcessClient.runSync(
+                executableURL: updater,
+                arguments: arguments,
+                currentDirectoryURL: URL(fileURLWithPath: databaseDirectory)
+            )
+        }.value
+
+        if result.exitCode != 0, self.isUnknownBlastDBVersionOption(result.output) {
+            var fallbackArguments = arguments
+            if let optionIndex = fallbackArguments.firstIndex(of: "--blastdb_version"),
+               fallbackArguments.indices.contains(optionIndex + 1) {
+                fallbackArguments.removeSubrange(optionIndex...(optionIndex + 1))
+            }
+            databaseLog = "This update_blastdb.pl does not support --blastdb_version. Retrying without it: \(names.joined(separator: ", "))"
+            return try await Task.detached {
                 try ProcessClient.runSync(
                     executableURL: updater,
-                    arguments: arguments,
+                    arguments: fallbackArguments,
                     currentDirectoryURL: URL(fileURLWithPath: databaseDirectory)
                 )
             }.value
-            if result.exitCode != 0, self.isUnknownBlastDBVersionOption(result.output) {
-                var fallbackArguments = arguments
-                if let optionIndex = fallbackArguments.firstIndex(of: "--blastdb_version"),
-                   fallbackArguments.indices.contains(optionIndex + 1) {
-                    fallbackArguments.removeSubrange(optionIndex...(optionIndex + 1))
-                }
-                databaseLog = "This update_blastdb.pl does not support --blastdb_version. Retrying without it: \(names.joined(separator: ", "))"
-                let fallbackResult = try await Task.detached {
+        }
+
+        return result
+    }
+
+    private func downloadClusteredNRDatabase(databaseDirectory: String, decompress: Bool) async throws -> ProcessResult {
+        guard let clusteredNRMetadataURL else {
+            return ProcessResult(exitCode: 1, output: "ClusteredNR metadata URL is not configured.")
+        }
+        guard let curl = ProcessClient.resolveExecutable(named: "curl", preferences: preferences) else {
+            return ProcessResult(exitCode: 1, output: LocalBlastError.toolMissing("curl").localizedDescription)
+        }
+        guard let tar = ProcessClient.resolveExecutable(named: "tar", preferences: preferences) else {
+            return ProcessResult(exitCode: 1, output: LocalBlastError.toolMissing("tar").localizedDescription)
+        }
+
+        let (data, _) = try await URLSession.shared.data(from: clusteredNRMetadataURL)
+        let metadata = try JSONDecoder().decode(BlastDatabaseMetadataRecord.self, from: data)
+        let fileURLs = (metadata.files ?? [])
+            .map { $0.replacingOccurrences(of: "ftp://", with: "https://") }
+            .compactMap { URL(string: $0) }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+
+        guard metadata.dbname == RecommendedBlastDatabases.blastp, !fileURLs.isEmpty else {
+            return ProcessResult(exitCode: 1, output: "ClusteredNR metadata did not include downloadable archives.")
+        }
+
+        var completedArchives = 0
+        for fileURL in fileURLs {
+            let archiveName = fileURL.lastPathComponent
+            let archiveResult = try await Task.detached {
+                try ProcessClient.runSync(
+                    executableURL: curl,
+                    arguments: ["-fL", "-C", "-", "-O", fileURL.absoluteString],
+                    currentDirectoryURL: URL(fileURLWithPath: databaseDirectory, isDirectory: true)
+                )
+            }.value
+            guard archiveResult.exitCode == 0 else {
+                return ProcessResult(exitCode: archiveResult.exitCode, output: archiveResult.output)
+            }
+
+            if let md5URL = URL(string: "\(fileURL.absoluteString).md5") {
+                let md5Result = try await Task.detached {
                     try ProcessClient.runSync(
-                        executableURL: updater,
-                        arguments: fallbackArguments,
-                        currentDirectoryURL: URL(fileURLWithPath: databaseDirectory)
+                        executableURL: curl,
+                        arguments: ["-fL", "-C", "-", "-O", md5URL.absoluteString],
+                        currentDirectoryURL: URL(fileURLWithPath: databaseDirectory, isDirectory: true)
                     )
                 }.value
-                markInstalledDatabases()
-                databaseLog = fallbackResult.output.isEmpty
-                    ? "Download finished with exit code \(fallbackResult.exitCode)."
-                    : fallbackResult.output
-                return
+                guard md5Result.exitCode == 0 else {
+                    return ProcessResult(exitCode: md5Result.exitCode, output: md5Result.output)
+                }
             }
-            markInstalledDatabases()
-            databaseLog = result.output.isEmpty
-                ? "Download finished with exit code \(result.exitCode)."
-                : result.output
-        } catch {
-            databaseLog = "Download failed: \(error.localizedDescription)"
+
+            if decompress {
+                let tarResult = try await Task.detached {
+                    try ProcessClient.runSync(
+                        executableURL: tar,
+                        arguments: ["-xzf", archiveName],
+                        currentDirectoryURL: URL(fileURLWithPath: databaseDirectory, isDirectory: true)
+                    )
+                }.value
+                guard tarResult.exitCode == 0 else {
+                    return ProcessResult(exitCode: tarResult.exitCode, output: tarResult.output)
+                }
+            }
+            completedArchives += 1
         }
+
+        return ProcessResult(
+            exitCode: 0,
+            output: "ClusteredNR download finished: \(completedArchives) archives processed for \(RecommendedBlastDatabases.blastp)."
+        )
+    }
+
+    func monitorSelectedDatabases() async {
+        guard !selectedDatabaseNames.isEmpty else {
+            databaseLog = LocalBlastError.emptyDownloadSelection.localizedDescription
+            return
+        }
+
+        ensureWorkingDirectories()
+        let names = selectedDatabaseNames.sorted()
+        databaseLog = "Monitoring selected databases: \(names.joined(separator: ", "))"
+        let expectedCompressedBytes = await fetchExpectedCompressedBytes(for: names)
+        startDownloadProgress(
+            names: names,
+            directory: preferences.databaseDirectory,
+            expectedCompressedBytes: expectedCompressedBytes,
+            status: "Monitoring folder"
+        )
+    }
+
+    func stopDownloadProgressMonitor() {
+        finishDownloadProgress(exitCode: nil, failureMessage: "Monitoring stopped")
+    }
+
+    private func fetchExpectedCompressedBytes(for names: [String]) async -> Int64? {
+        guard let url = URL(string: "https://ftp.ncbi.nlm.nih.gov/blast/db/blastdb-metadata-1-1.json") else {
+            return nil
+        }
+
+        let selected = Set(names)
+        var matchedNames = Set<String>()
+        var total = Int64(0)
+
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let records = try JSONDecoder().decode([BlastDatabaseMetadataRecord].self, from: data)
+            for record in records where selected.contains(record.dbname) {
+                if let bytesTotal = record.bytesTotal {
+                    total += bytesTotal
+                }
+                matchedNames.insert(record.dbname)
+            }
+        } catch {
+            total = 0
+            matchedNames.removeAll()
+        }
+
+        if selected.contains(RecommendedBlastDatabases.blastp),
+           !matchedNames.contains(RecommendedBlastDatabases.blastp),
+           let clusteredNRMetadataURL {
+            do {
+                let (data, _) = try await URLSession.shared.data(from: clusteredNRMetadataURL)
+                let record = try JSONDecoder().decode(BlastDatabaseMetadataRecord.self, from: data)
+                if record.dbname == RecommendedBlastDatabases.blastp, let bytesTotal = record.bytesTotal {
+                    total += bytesTotal
+                }
+            } catch {
+                // The regular NCBI manifest is enough for all non-experimental databases.
+            }
+        }
+
+        return total > 0 ? total : nil
+    }
+
+    private func startDownloadProgress(
+        names: [String],
+        directory: String,
+        expectedCompressedBytes: Int64?,
+        status: String = "Starting download"
+    ) {
+        downloadProgressTask?.cancel()
+        downloadProgress = DownloadProgressSnapshot()
+        downloadProgressNames = names
+        downloadProgressDirectory = directory
+        downloadProgressBaseline = DownloadDirectoryScanner.scan(directory: directory, databaseNames: names)
+
+        applyDownloadProgressScan(
+            downloadProgressBaseline,
+            isActive: true,
+            names: names,
+            expectedCompressedBytes: expectedCompressedBytes,
+            status: status
+        )
+
+        downloadProgressTask = Task { [weak self, directory, names, expectedCompressedBytes] in
+            while !Task.isCancelled {
+                let scan = DownloadDirectoryScanner.scan(directory: directory, databaseNames: names)
+                await MainActor.run {
+                    self?.applyDownloadProgressScan(
+                        scan,
+                        isActive: true,
+                        names: names,
+                        expectedCompressedBytes: expectedCompressedBytes,
+                        status: "Downloading"
+                    )
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func finishDownloadProgress(exitCode: Int32?, failureMessage: String? = nil) {
+        downloadProgressTask?.cancel()
+        downloadProgressTask = nil
+
+        guard !downloadProgressDirectory.isEmpty, !downloadProgressNames.isEmpty else {
+            return
+        }
+
+        let scan = DownloadDirectoryScanner.scan(
+            directory: downloadProgressDirectory,
+            databaseNames: downloadProgressNames
+        )
+        let status: String
+        if let failureMessage {
+            status = "Download failed: \(failureMessage)"
+        } else if exitCode == 0 {
+            status = "Download finished"
+        } else if let exitCode {
+            status = "Download exited with code \(exitCode)"
+        } else {
+            status = "Download stopped"
+        }
+
+        applyDownloadProgressScan(
+            scan,
+            isActive: false,
+            names: downloadProgressNames,
+            expectedCompressedBytes: downloadProgress.expectedCompressedBytes,
+            status: status
+        )
+    }
+
+    private func applyDownloadProgressScan(
+        _ scan: DownloadDirectoryScan,
+        isActive: Bool,
+        names: [String],
+        expectedCompressedBytes: Int64?,
+        status: String
+    ) {
+        let startedAt = downloadProgress.startedAt ?? Date()
+        let addedBytes = max(scan.observedCompressedBytes - downloadProgressBaseline.observedCompressedBytes, 0)
+        downloadProgress = DownloadProgressSnapshot(
+            hasActivity: true,
+            isActive: isActive,
+            databaseNames: names,
+            startedAt: startedAt,
+            lastUpdated: Date(),
+            expectedCompressedBytes: expectedCompressedBytes,
+            observedCompressedBytes: scan.observedCompressedBytes,
+            addedCompressedBytes: addedBytes,
+            archiveCount: scan.archiveCount,
+            verifiedArchiveCount: scan.verifiedArchiveCount,
+            matchingFileCount: scan.matchingFileCount,
+            activeDatabaseName: scan.activeDatabaseName,
+            activeFileName: scan.activeFileName,
+            activeFileBytes: scan.activeFileBytes,
+            status: status
+        )
     }
 
     private nonisolated func isUnknownBlastDBVersionOption(_ output: String) -> Bool {
@@ -630,16 +1073,21 @@ struct RootView: View {
     }
 }
 
+private func databaseEntrySort(_ lhs: BlastDatabaseEntry, _ rhs: BlastDatabaseEntry) -> Bool {
+    let lhsRank = RecommendedBlastDatabases.rank(for: lhs.name)
+    let rhsRank = RecommendedBlastDatabases.rank(for: rhs.name)
+    if lhsRank != rhsRank { return lhsRank < rhsRank }
+    if lhs.isInstalled != rhs.isInstalled { return lhs.isInstalled && !rhs.isInstalled }
+    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+}
+
 struct RunBlastView: View {
     @EnvironmentObject private var model: AppModel
 
     var availableDatabases: [BlastDatabaseEntry] {
         model.databaseCatalog
             .filter { $0.kind == model.configuration.program.databaseKind || model.configuration.program.databaseKind == .mixed || $0.kind == .mixed }
-            .sorted { lhs, rhs in
-                if lhs.isInstalled != rhs.isInstalled { return lhs.isInstalled && !rhs.isInstalled }
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-            }
+            .sorted(by: databaseEntrySort)
     }
 
     var body: some View {
@@ -791,7 +1239,8 @@ struct RunBlastView: View {
         Panel(title: "Search Set", systemImage: "externaldrive.connected.to.line.below") {
             Picker("Database", selection: $model.configuration.databaseName) {
                 ForEach(availableDatabases) { database in
-                    Text("\(database.name)\(database.isInstalled ? "" : " - not installed")")
+                    let recommendation = RecommendedBlastDatabases.label(for: database.name).map { " - \($0)" } ?? ""
+                    Text("\(database.name)\(recommendation)\(database.isInstalled ? "" : " - not installed")")
                         .tag(database.name)
                 }
             }
@@ -1029,7 +1478,7 @@ struct DatabasesView: View {
     private var notInstalledDatabases: [BlastDatabaseEntry] {
         model.databaseCatalog
             .filter { !$0.isInstalled }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            .sorted(by: databaseEntrySort)
     }
 
     private var installedSizeLabel: String {
@@ -1041,10 +1490,7 @@ struct DatabasesView: View {
         let filtered = query.isEmpty ? model.databaseCatalog : model.databaseCatalog.filter {
             $0.name.lowercased().contains(query) || $0.title.lowercased().contains(query)
         }
-        return filtered.sorted { lhs, rhs in
-            if lhs.isInstalled != rhs.isInstalled { return lhs.isInstalled && !rhs.isInstalled }
-            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-        }
+        return filtered.sorted(by: databaseEntrySort)
     }
 
     var body: some View {
@@ -1108,6 +1554,9 @@ struct DatabasesView: View {
             }
 
             installedSummaryPanel
+            if model.downloadProgress.hasActivity {
+                downloadProgressPanel
+            }
             downloadCatalogPanel
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1142,6 +1591,12 @@ struct DatabasesView: View {
                 }
 
                 Button {
+                    model.selectRecommendedStarterDatabases()
+                } label: {
+                    Label("Select Starters", systemImage: "star.fill")
+                }
+
+                Button {
                     model.selectedDatabaseNames.removeAll()
                 } label: {
                     Label("Clear", systemImage: "xmark.circle")
@@ -1154,6 +1609,21 @@ struct DatabasesView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(model.isDownloading)
+
+                if model.downloadProgress.isActive && !model.isDownloading {
+                    Button {
+                        model.stopDownloadProgressMonitor()
+                    } label: {
+                        Label("Stop Monitor", systemImage: "pause.circle")
+                    }
+                } else {
+                    Button {
+                        Task { await model.monitorSelectedDatabases() }
+                    } label: {
+                        Label("Monitor Selected", systemImage: "waveform.path.ecg")
+                    }
+                    .disabled(model.isDownloading)
+                }
             }
 
             List(filteredDatabases) { database in
@@ -1172,8 +1642,19 @@ struct DatabasesView: View {
                     Image(systemName: database.isInstalled ? "checkmark.seal.fill" : "circle")
                         .foregroundStyle(database.isInstalled ? .green : .secondary)
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(database.name)
-                            .font(.headline)
+                        HStack(spacing: 6) {
+                            Text(database.name)
+                                .font(.headline)
+                            if let recommendation = RecommendedBlastDatabases.label(for: database.name) {
+                                Text(recommendation)
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(.blue)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.blue.opacity(0.12))
+                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            }
+                        }
                         Text(database.title)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -1186,6 +1667,73 @@ struct DatabasesView: View {
                 .padding(.vertical, 3)
             }
             .frame(minHeight: 360)
+        }
+    }
+
+    private var downloadProgressPanel: some View {
+        let progress = model.downloadProgress
+        return Panel(title: "Download Progress", systemImage: "arrow.down.circle") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(progress.status)
+                        .font(.headline)
+                    Spacer()
+                    if progress.isActive {
+                        Label("Active", systemImage: "bolt.fill")
+                            .font(.caption)
+                            .foregroundStyle(.blue)
+                    } else {
+                        Label("Stopped", systemImage: "pause.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let fraction = progress.fractionComplete {
+                    ProgressView(value: fraction)
+                    Text("\(percentLabel(fraction)) of expected compressed download size")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ProgressView()
+                    Text("Expected size is unavailable; showing observed archive growth.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 16) {
+                    SummaryMetric(label: "Observed", value: byteLabel(progress.observedCompressedBytes))
+                    SummaryMetric(label: "This Run", value: byteLabel(progress.addedCompressedBytes))
+                    SummaryMetric(label: "Speed", value: speedLabel(progress.bytesPerSecond))
+                    SummaryMetric(label: "Time Left", value: etaLabel(progress.estimatedTimeRemaining))
+                    SummaryMetric(label: "Finish", value: finishTimeLabel(progress.estimatedFinishDate))
+                }
+
+                if !progress.activeFileName.isEmpty {
+                    HStack {
+                        Label(progress.activeFileName, systemImage: "doc")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Text(byteLabel(progress.activeFileBytes))
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.caption)
+                }
+
+                HStack(spacing: 12) {
+                    Label("\(progress.verifiedArchiveCount) verified archives", systemImage: "checkmark.seal")
+                    Label("\(progress.archiveCount) archives seen", systemImage: "archivebox")
+                    Label(durationLabel(progress.elapsed), systemImage: "clock")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Text(selectedDatabasesLabel(progress.databaseNames))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
         }
     }
 
@@ -1286,6 +1834,57 @@ struct DatabasesView: View {
             .buttonStyle(.borderedProminent)
             .disabled(model.isDownloading)
         }
+    }
+
+    private func byteLabel(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    private func percentLabel(_ fraction: Double) -> String {
+        let percent = min(max(fraction * 100, 0), 100)
+        return percent >= 10
+            ? String(format: "%.0f%%", percent)
+            : String(format: "%.1f%%", percent)
+    }
+
+    private func speedLabel(_ bytesPerSecond: Double) -> String {
+        guard bytesPerSecond > 1 else { return "--" }
+        return "\(byteLabel(Int64(bytesPerSecond)))/s"
+    }
+
+    private func etaLabel(_ seconds: TimeInterval?) -> String {
+        guard let seconds, seconds.isFinite, seconds > 0 else { return "Calculating" }
+        return durationLabel(seconds)
+    }
+
+    private func finishTimeLabel(_ date: Date?) -> String {
+        guard let date else { return "--" }
+        return date.formatted(date: .omitted, time: .shortened)
+    }
+
+    private func durationLabel(_ seconds: TimeInterval) -> String {
+        let totalSeconds = max(Int(seconds.rounded()), 0)
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        }
+        if minutes > 0 {
+            return "\(minutes)m \(seconds)s"
+        }
+        return "\(seconds)s"
+    }
+
+    private func selectedDatabasesLabel(_ names: [String]) -> String {
+        guard !names.isEmpty else { return "No selected databases." }
+        let visible = names.prefix(6).joined(separator: ", ")
+        let hiddenCount = names.count - min(names.count, 6)
+        if hiddenCount > 0 {
+            return "Selected: \(visible), +\(hiddenCount) more"
+        }
+        return "Selected: \(visible)"
     }
 }
 

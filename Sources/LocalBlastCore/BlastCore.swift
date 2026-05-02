@@ -77,6 +77,52 @@ public enum BlastProgram: String, CaseIterable, Codable, Identifiable, Sendable 
             "Protein search seeded from conserved domain matches."
         }
     }
+
+    public var recommendedDatabaseName: String? {
+        switch self {
+        case .blastn:
+            RecommendedBlastDatabases.blastn
+        case .blastp:
+            RecommendedBlastDatabases.blastp
+        default:
+            nil
+        }
+    }
+}
+
+public enum RecommendedBlastDatabases {
+    public static let blastn = "core_nt"
+    public static let blastp = "nr_cluster_seq"
+    public static let starterNames = [blastn, blastp]
+
+    public static let entries: [BlastDatabaseEntry] = [
+        .init(
+            name: blastn,
+            title: "Core nucleotide BLAST database - recommended starter for BLASTN",
+            kind: .nucleotide
+        ),
+        .init(
+            name: blastp,
+            title: "Clustered NR protein sequences - recommended starter for BLASTP",
+            kind: .protein,
+            source: "NCBI ClusteredNR"
+        )
+    ]
+
+    public static func rank(for name: String) -> Int {
+        starterNames.firstIndex(of: name) ?? Int.max
+    }
+
+    public static func label(for name: String) -> String? {
+        switch name {
+        case blastn:
+            "Recommended for BLASTN"
+        case blastp:
+            "Recommended for BLASTP"
+        default:
+            nil
+        }
+    }
 }
 
 public enum BlastOptionControl: String, Codable, Sendable {
@@ -620,6 +666,8 @@ public struct BlastDatabaseEntry: Identifiable, Codable, Hashable, Sendable {
 
 public enum FallbackDatabaseCatalog {
     public static let entries: [BlastDatabaseEntry] = [
+        .init(name: "core_nt", title: "Core nucleotide BLAST database - recommended starter for BLASTN", kind: .nucleotide),
+        .init(name: "nr_cluster_seq", title: "Clustered NR protein sequences - recommended starter for BLASTP", kind: .protein, source: "NCBI ClusteredNR"),
         .init(name: "nt", title: "Nucleotide collection (nr/nt)", kind: .nucleotide),
         .init(name: "nr", title: "Non-redundant protein sequences", kind: .protein),
         .init(name: "refseq_rna", title: "RefSeq RNA", kind: .nucleotide),
@@ -673,7 +721,7 @@ public struct BlastSearchConfiguration: Codable, Equatable, Sendable {
         subjectText: String = "",
         subjectFilePath: String = "",
         subjectSubrange: String = "",
-        databaseName: String = "nt",
+        databaseName: String = RecommendedBlastDatabases.blastn,
         databaseDirectory: String = "",
         outputPath: String = "",
         optionValues: [String: String] = BlastParameterCatalog.defaultValues(for: .blastn),
@@ -910,7 +958,15 @@ public enum BlastDatabaseParser {
                 )
             )
         }
-        return entries.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return includingRecommended(entries)
+    }
+
+    public static func includingRecommended(_ entries: [BlastDatabaseEntry]) -> [BlastDatabaseEntry] {
+        var merged = entries
+        for recommendedEntry in RecommendedBlastDatabases.entries where !merged.contains(where: { $0.name == recommendedEntry.name }) {
+            merged.append(recommendedEntry)
+        }
+        return merged.sorted(by: recommendedSort)
     }
 
     public static func markInstalled(_ entries: [BlastDatabaseEntry], installedNames: Set<String>) -> [BlastDatabaseEntry] {
@@ -919,6 +975,13 @@ public enum BlastDatabaseParser {
             copy.isInstalled = installedNames.contains(entry.name)
             return copy
         }
+    }
+
+    public static func recommendedSort(_ lhs: BlastDatabaseEntry, _ rhs: BlastDatabaseEntry) -> Bool {
+        let lhsRank = RecommendedBlastDatabases.rank(for: lhs.name)
+        let rhsRank = RecommendedBlastDatabases.rank(for: rhs.name)
+        if lhsRank != rhsRank { return lhsRank < rhsRank }
+        return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
     }
 
     public static func inferKind(from name: String) -> SequenceKind {

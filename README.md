@@ -11,7 +11,7 @@ The app is intentionally local-first. It does not contact NCBI on launch, and it
 ## Features
 
 - Runs local `blastn`, `blastp`, `blastx`, `tblastn`, `tblastx`, `psiblast`, `rpsblast`, `rpstblastn`, and `deltablast`.
-- Supports local database searches with downloaded BLAST databases such as `nt`, `nr`, `refseq_protein`, and `refseq_rna`.
+- Supports local database searches with downloaded BLAST databases such as `core_nt`, `nr_cluster_seq`, `nt`, `nr`, `refseq_protein`, and `refseq_rna`.
 - Supports pairwise sequence comparison with **Align two sequences**, using BLAST+'s `-subject` mode instead of a database.
 - Provides website-style controls for common BLAST parameters: task, E-value, max target sequences, word size, scoring, filters, masking, output format, genetic code, ranges, and PSI-BLAST settings.
 - Provides a raw advanced-arguments field, appended last, for BLAST+ switches that are not yet represented by structured controls.
@@ -98,7 +98,7 @@ The DMG script builds separate `arm64` and `x86_64` release binaries, combines t
 3. Open **Databases** and choose a BLASTDB directory.
 4. The app scans installed databases immediately without contacting NCBI.
 5. Click **Refresh Catalog** only when you want to fetch the latest downloadable list from NCBI.
-6. Select databases and click **Download Selected**.
+6. Start with `core_nt` for BLASTN and `nr_cluster_seq` for BLASTP, or select other databases and click **Download Selected**.
 7. Open **Run BLAST**, paste or choose a FASTA query, pick a database, set options, and run.
 
 ## Running A Database Search
@@ -108,7 +108,7 @@ For a normal search, leave **Align two sequences** unchecked.
 The app generates a command shaped like:
 
 ```sh
-blastn -query query.fasta -db /path/to/blastdb/nt -out result.txt -task megablast
+blastn -query query.fasta -db core_nt -out result.txt -task megablast
 ```
 
 The app sets `BLASTDB` for the BLAST process and also passes the selected database path directly.
@@ -135,21 +135,25 @@ blastp -query query.faa -subject subject.faa -out pairwise.txt
 NCBI distributes preformatted BLAST databases as archives, often split into many volumes. Local BLAST Studio delegates downloads to NCBI's official script:
 
 ```sh
-update_blastdb.pl --decompress --blastdb_version 5 nt nr
+update_blastdb.pl --decompress --blastdb_version 5 core_nt
 ```
 
 The app can also fall back when an older script does not support `--blastdb_version`.
 
-When **Decompress after download** is enabled, the script downloads `.tar.gz` archives, extracts the BLAST database files, keeps checksum files, and removes the large archive payloads after extraction. During a download, temporary storage can be higher than the final installed database size because archives and extracted files can overlap.
+ClusteredNR (`nr_cluster_seq`) is published through NCBI's ClusteredNR experimental metadata rather than the regular `update_blastdb.pl --showall` manifest. Local BLAST Studio treats it as a recommended BLASTP starter database and downloads it directly from NCBI's experimental archive list.
+
+When **Decompress after download** is enabled, the app downloads `.tar.gz` archives, extracts the BLAST database files, and keeps checksum files. During a download, temporary storage can be higher than the final installed database size because archives and extracted files can overlap.
 
 Downloads are resumable in practice because rerunning `update_blastdb.pl` skips or reuses existing local archives/files when possible.
 
 ## Database Sizes
 
-These sizes come from NCBI's BLAST metadata manifest on May 2, 2026. They change as NCBI updates the databases.
+These sizes come from NCBI's BLAST metadata manifest on May 2, 2026. `nr_cluster_seq` comes from NCBI's ClusteredNR experimental metadata. They change as NCBI updates the databases.
 
 | Database | Volumes | Compressed Download | Installed Size | Last Updated |
 |---|---:|---:|---:|---|
+| `core_nt` | 88 | 291.86 GB | not yet measured | 2026-04-29 |
+| `nr_cluster_seq` | 247 | 243.06 GB | not yet measured | 2026-04-24 |
 | `nt` | 313 | 811.66 GB | 967.59 GB | 2026-04-29 |
 | `nr` | 156 | 360.47 GB | 695.75 GB | 2026-04-28 |
 | `refseq_protein` | 59 | 143.69 GB | 261.32 GB | 2026-04-30 |
@@ -190,6 +194,8 @@ Examples:
 | `swissprot` | under 1 min | under 1 min | under 1 min |
 | `refseq_rna` | 1.8 hr | 43 min | 21 min |
 | `refseq_protein` | 4.0 hr | 1.6 hr | 48 min |
+| `nr_cluster_seq` | 6.8 hr | 2.7 hr | 1.4 hr |
+| `core_nt` | 8.1 hr | 3.2 hr | 1.6 hr |
 | `nr` | 10.0 hr | 4.0 hr | 2.0 hr |
 | `nt` | 22.5 hr | 9.0 hr | 4.5 hr |
 | Full manifest | 81.9 hr | 32.7 hr | 16.4 hr |
@@ -200,9 +206,10 @@ After downloading, decompression and checksum work can add more time.
 
 For most users:
 
-- Start with `taxdb`, `swissprot`, `refseq_rna`, and `refseq_protein`.
-- Add `nr` when you need broad protein search coverage.
-- Add `nt` when you need broad nucleotide search coverage.
+- Start with `core_nt` for BLASTN. It is the practical nucleotide starter database and is much smaller than full `nt`.
+- Start with ClusteredNR, `nr_cluster_seq`, for BLASTP. It searches representative protein clusters from `nr` and is the preferred protein starter set.
+- Add `taxdb` when you need taxonomy names in reports.
+- Add `nr` or `nt` only when you specifically need the broader legacy collections.
 - Avoid downloading the full manifest unless you have multiple terabytes free and a clear need.
 
 macOS Finder may show "free" space that includes purgeable storage. Terminal tools such as `df -h` often show immediately available non-purgeable space. Plan using the more conservative number.

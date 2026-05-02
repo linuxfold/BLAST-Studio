@@ -9,6 +9,12 @@ func require(_ condition: @autoclosure () -> Bool, _ message: String) {
 }
 
 do {
+    let defaultConfiguration = BlastSearchConfiguration()
+    require(defaultConfiguration.databaseName == RecommendedBlastDatabases.blastn, "BLASTN should default to core_nt")
+    require(BlastProgram.blastn.recommendedDatabaseName == RecommendedBlastDatabases.blastn, "BLASTN recommended database is wrong")
+    require(BlastProgram.blastp.recommendedDatabaseName == RecommendedBlastDatabases.blastp, "BLASTP recommended database is wrong")
+    require(RecommendedBlastDatabases.rank(for: RecommendedBlastDatabases.blastn) < RecommendedBlastDatabases.rank(for: "nt"), "core_nt should sort before nt")
+
     var configuration = BlastSearchConfiguration(
         program: .blastn,
         databaseName: "nt",
@@ -66,6 +72,8 @@ do {
     """
     let entries = BlastDatabaseParser.parseShowAll(showAll)
     require(!entries.contains { $0.name == "Connected" }, "status chatter was parsed as a database")
+    require(entries.contains { $0.name == "core_nt" && $0.kind == .nucleotide }, "recommended core_nt not present")
+    require(entries.contains { $0.name == "nr_cluster_seq" && $0.kind == .protein }, "recommended nr_cluster_seq not present")
     require(entries.contains { $0.name == "nr" && $0.kind == .protein }, "nr not parsed")
     require(entries.contains { $0.name == "nt" && $0.kind == .nucleotide }, "nt not parsed")
     require(entries.contains { $0.name == "swissprot" && $0.kind == .protein }, "swissprot not parsed")
