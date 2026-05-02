@@ -4,6 +4,8 @@
 
 Local BLAST Studio is a native macOS app for running the NCBI BLAST+ command-line suite locally through a GUI. It wraps your installed BLAST+ binaries, scans your local BLAST database folder, manages downloads with NCBI's `update_blastdb.pl`, and keeps the generated command line visible before each run.
 
+>If installing from precompiled .dmg, after dragging the app into your Aplications, type: xattr -dr com.apple.quarantine /Applications/LocalBlastStudio.app
+
 The app is intentionally local-first. It does not contact NCBI on launch, and it does not upload query sequences. It contacts NCBI only when you explicitly click **Refresh Catalog** or **Download Selected**.
 
 ## Features
