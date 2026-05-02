@@ -21,10 +21,19 @@ do {
 
     let command = try BlastCommandBuilder.build(configuration: configuration, queryPath: "/tmp/query.fa")
     require(command.executableName == "blastn", "wrong executable")
-    require(command.arguments.contains("/blast/db/nt"), "missing database path")
+    require(command.arguments.contains("-db") && command.arguments.contains("nt"), "missing database name")
+    require(!command.arguments.contains("/blast/db/nt"), "database path should be supplied through BLASTDB")
+    require(command.environment["BLASTDB"] == "/blast/db", "missing BLASTDB environment")
+    require(command.preview.hasPrefix("BLASTDB=/blast/db blastn "), "preview should show BLASTDB assignment")
     require(command.arguments.contains("-dust") && command.arguments.contains("no"), "missing dust override")
     require(command.arguments.contains("-max_target_seqs") && command.arguments.contains("25"), "missing max target override")
     require(command.arguments.contains("6 qseqid sseqid evalue"), "quoted outfmt was not preserved")
+
+    configuration.databaseDirectory = "/Users/home/Library/Application Support/LocalBlastStudio/Databases"
+    let spacedPathCommand = try BlastCommandBuilder.build(configuration: configuration, queryPath: "/tmp/query.fa")
+    require(spacedPathCommand.arguments.contains("nt"), "database name changed for spaced BLASTDB path")
+    require(spacedPathCommand.environment["BLASTDB"] == configuration.databaseDirectory, "spaced BLASTDB path not preserved")
+    require(spacedPathCommand.preview.hasPrefix("BLASTDB='/Users/home/Library/Application Support/LocalBlastStudio/Databases' blastn "), "spaced BLASTDB path was not shell-escaped")
 
     var pairwise = BlastSearchConfiguration(
         program: .blastp,

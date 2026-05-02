@@ -702,9 +702,20 @@ public struct BlastSearchConfiguration: Codable, Equatable, Sendable {
 public struct BlastCommand: Equatable, Sendable {
     public var executableName: String
     public var arguments: [String]
+    public var environment: [String: String]
+
+    public init(executableName: String, arguments: [String], environment: [String: String] = [:]) {
+        self.executableName = executableName
+        self.arguments = arguments
+        self.environment = environment
+    }
 
     public var preview: String {
-        ([executableName] + arguments).map(\.shellEscaped).joined(separator: " ")
+        let assignments = environment.keys.sorted().map { key in
+            "\(key)=\(environment[key, default: ""].shellEscaped)"
+        }
+        let command = [executableName.shellEscaped] + arguments.map(\.shellEscaped)
+        return (assignments + command).joined(separator: " ")
     }
 }
 
@@ -775,15 +786,31 @@ public enum BlastCommandBuilder {
             throw BlastCommandBuildError.malformedRawArguments(configuration.rawArguments)
         }
 
-        return BlastCommand(executableName: configuration.program.executableName, arguments: arguments)
+        return BlastCommand(
+            executableName: configuration.program.executableName,
+            arguments: arguments,
+            environment: environment(for: configuration)
+        )
     }
 
     private static func databaseArgument(for configuration: BlastSearchConfiguration) -> String {
+        let databaseName = configuration.databaseName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return databaseName
+    }
+
+    private static func environment(for configuration: BlastSearchConfiguration) -> [String: String] {
+        guard !configuration.alignTwoSequences else { return [:] }
         let directory = configuration.databaseDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !directory.isEmpty else { return configuration.databaseName }
-        return URL(fileURLWithPath: directory)
-            .appendingPathComponent(configuration.databaseName)
-            .path
+        let databaseName = configuration.databaseName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !directory.isEmpty, !isPathLikeDatabaseName(databaseName) else { return [:] }
+        return ["BLASTDB": directory]
+    }
+
+    private static func isPathLikeDatabaseName(_ databaseName: String) -> Bool {
+        databaseName.hasPrefix("/")
+            || databaseName.hasPrefix("~")
+            || databaseName.hasPrefix(".")
+            || databaseName.contains("/")
     }
 
     public static func splitShellArguments(_ input: String) throws -> [String] {

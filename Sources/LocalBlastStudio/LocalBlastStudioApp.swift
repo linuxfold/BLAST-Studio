@@ -539,12 +539,11 @@ final class AppModel: ObservableObject {
                 subjectPath: subjectPath
             )
             runLog = "Running \(command.preview)"
-            let databaseDirectory = preferences.databaseDirectory
             let result = try await Task.detached {
                 try ProcessClient.runSync(
                     executableURL: executable,
                     arguments: command.arguments,
-                    environment: ["BLASTDB": databaseDirectory]
+                    environment: command.environment
                 )
             }.value
 
