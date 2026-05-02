@@ -73,6 +73,20 @@ The packaged app is created at:
 dist/LocalBlastStudio.app
 ```
 
+Create a universal Intel + Apple Silicon DMG:
+
+```sh
+./scripts/package_dmg.sh
+```
+
+The DMG is created at:
+
+```sh
+dist/BLAST-Studio-0.1.0-universal.dmg
+```
+
+The DMG script builds separate `arm64` and `x86_64` release binaries, combines them with `lipo`, creates a drag-to-Applications disk image, and ad-hoc signs the app by default. It is not notarized. To sign with a Developer ID certificate, run it with `CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./scripts/package_dmg.sh`.
+
 ## First Launch
 
 1. Open **Tools** and confirm BLAST+ tools are detected.
@@ -222,6 +236,7 @@ Sources/LocalBlastStudio/      SwiftUI macOS app
 Sources/LocalBlastSmokeTests/  Lightweight executable smoke checks
 Resources/                     App icon source
 scripts/package_app.sh         Release app bundle packaging
+scripts/package_dmg.sh         Universal Intel/Apple Silicon DMG packaging
 ```
 
 ## References
