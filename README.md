@@ -1,5 +1,7 @@
 # Local BLAST Studio
 
+<img width="500" height="500" alt="ChatGPT Image May 1, 2026, 01_02_34 AM" src="https://github.com/user-attachments/assets/226fc2b0-1eae-42ec-b37a-794ff4673eae" />
+
 Local BLAST Studio is a native macOS app for running the NCBI BLAST+ command-line suite locally through a GUI. It wraps your installed BLAST+ binaries, scans your local BLAST database folder, manages downloads with NCBI's `update_blastdb.pl`, and keeps the generated command line visible before each run.
 
 The app is intentionally local-first. It does not contact NCBI on launch, and it does not upload query sequences. It contacts NCBI only when you explicitly click **Refresh Catalog** or **Download Selected**.
