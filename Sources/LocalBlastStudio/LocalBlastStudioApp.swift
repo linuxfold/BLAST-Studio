@@ -26,6 +26,7 @@ struct LocalBlastStudioApp: App {
 
 enum WorkspaceSection: String, CaseIterable, Identifiable {
     case run = "Run BLAST"
+    case rnaSeq = "RNA-Seq"
     case databases = "Databases"
     case tools = "Tools"
     case jobs = "Jobs"
@@ -35,6 +36,7 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
     var systemImage: String {
         switch self {
         case .run: "play.circle"
+        case .rnaSeq: "waveform.path.ecg"
         case .databases: "internaldrive"
         case .tools: "wrench.and.screwdriver"
         case .jobs: "clock.arrow.circlepath"
@@ -95,6 +97,152 @@ struct BlastJobRecord: Identifiable, Hashable {
     var commandPreview: String
     var exitCode: Int32
     var date: Date
+}
+
+enum RNASeqOutputField: String, CaseIterable, Codable, Hashable, Identifiable, Sendable {
+    case qseqid
+    case sseqid
+    case stitle
+    case pident
+    case length
+    case qstart
+    case qend
+    case sstart
+    case send
+    case evalue
+    case bitscore
+    case qcovhsp
+    case staxids
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .qseqid: "Read ID"
+        case .sseqid: "Subject ID"
+        case .stitle: "Subject title"
+        case .pident: "Identity %"
+        case .length: "Alignment length"
+        case .qstart: "Query start"
+        case .qend: "Query end"
+        case .sstart: "Subject start"
+        case .send: "Subject end"
+        case .evalue: "E-value"
+        case .bitscore: "Bit score"
+        case .qcovhsp: "Query coverage"
+        case .staxids: "Taxonomy IDs"
+        }
+    }
+
+    static let defaults: Set<RNASeqOutputField> = [
+        .qseqid, .sseqid, .stitle, .pident, .length,
+        .qstart, .qend, .sstart, .send, .evalue, .bitscore
+    ]
+}
+
+struct RNASeqAnalysisConfiguration: Codable, Equatable, Sendable {
+    var inputFiles: [String] = []
+    var program: BlastProgram = .blastn
+    var databaseName: String = "refseq_rna"
+    var outputPath: String = ""
+    var blastnTask: String = "blastn"
+    var evalue: String = "1e-5"
+    var maxTargetSequences: String = "10"
+    var numThreads: String = "4"
+    var outputFields: Set<RNASeqOutputField> = RNASeqOutputField.defaults
+    var rawArguments: String = ""
+    var keepConvertedFasta: Bool = false
+
+    var outputFieldString: String {
+        RNASeqOutputField.allCases
+            .filter { outputFields.contains($0) }
+            .map(\.rawValue)
+            .joined(separator: " ")
+    }
+}
+
+enum RNASeqAnalysisStage: String, Codable, Sendable {
+    case idle = "Idle"
+    case preparing = "Preparing"
+    case converting = "Converting FASTQ"
+    case annotating = "Annotating"
+    case finished = "Finished"
+    case failed = "Failed"
+}
+
+struct RNASeqProgressSnapshot: Equatable, Sendable {
+    var hasActivity = false
+    var isActive = false
+    var stage: RNASeqAnalysisStage = .idle
+    var status = "Idle"
+    var inputFileCount = 0
+    var currentFileName = ""
+    var totalInputBytes: Int64 = 0
+    var processedInputBytes: Int64 = 0
+    var convertedReads: Int64 = 0
+    var outputBytes: Int64 = 0
+    var isConversionProgressDeterminate = true
+    var startedAt: Date?
+    var lastUpdated: Date?
+
+    var fractionComplete: Double? {
+        switch stage {
+        case .converting:
+            guard isConversionProgressDeterminate else { return nil }
+            guard totalInputBytes > 0 else { return nil }
+            return min(max(Double(processedInputBytes) / Double(totalInputBytes), 0), 1)
+        case .finished:
+            return 1
+        default:
+            return nil
+        }
+    }
+
+    var elapsed: TimeInterval {
+        guard let startedAt else { return 0 }
+        return Date().timeIntervalSince(startedAt)
+    }
+}
+
+struct RNASeqConversionProgress: Sendable {
+    var currentFilePath: String
+    var totalInputBytes: Int64
+    var processedInputBytes: Int64
+    var convertedReads: Int64
+    var outputBytes: Int64
+    var isDeterminate: Bool
+}
+
+enum RNASeqAnalysisError: Error, LocalizedError {
+    case noInputFiles
+    case missingDatabase
+    case missingOutputPath
+    case noOutputFields
+    case gzipUnavailable
+    case gzipFailed(file: String, message: String)
+    case cannotCreateOutputDirectory(String)
+    case malformedFASTQ(file: String, line: Int, reason: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noInputFiles:
+            "Add at least one FASTQ file."
+        case .missingDatabase:
+            "Choose a database for RNA-Seq annotation."
+        case .missingOutputPath:
+            "Choose an RNA-Seq annotation output file."
+        case .noOutputFields:
+            "Select at least one output field."
+        case .gzipUnavailable:
+            "Could not find gzip, which is required to stream .fq.gz and .fastq.gz inputs."
+        case .gzipFailed(let file, let message):
+            "gzip failed while reading \(URL(fileURLWithPath: file).lastPathComponent): \(message)"
+        case .cannotCreateOutputDirectory(let path):
+            "Could not create output directory: \(path)"
+        case .malformedFASTQ(let file, let line, let reason):
+            "Malformed FASTQ in \(URL(fileURLWithPath: file).lastPathComponent) near line \(line): \(reason)"
+        }
+    }
 }
 
 struct ProcessResult: Sendable {
@@ -291,7 +439,7 @@ enum ProcessClient {
     static let searchTools = BlastProgram.allCases.map(\.executableName)
     static let utilityTools = [
         "makeblastdb", "blastdbcmd", "update_blastdb.pl", "dustmasker", "segmasker",
-        "windowmasker", "makeprofiledb", "makembindex", "convert2blastmask"
+        "windowmasker", "makeprofiledb", "makembindex", "convert2blastmask", "gzip"
     ]
 
     static func resolveExecutable(named name: String, preferences: BlastPreferences) -> URL? {
@@ -399,6 +547,247 @@ enum ProcessClient {
     }
 }
 
+private final class FastqLineReader {
+    private let handle: FileHandle
+    private let closesHandle: Bool
+    private var buffer = Data()
+    private var reachedEnd = false
+
+    var bytesRead: Int64 = 0
+
+    init(url: URL) throws {
+        self.handle = try FileHandle(forReadingFrom: url)
+        self.closesHandle = true
+    }
+
+    init(handle: FileHandle, closesHandle: Bool = true) {
+        self.handle = handle
+        self.closesHandle = closesHandle
+    }
+
+    deinit {
+        if closesHandle {
+            try? handle.close()
+        }
+    }
+
+    func nextLine() throws -> Data? {
+        while true {
+            if let newlineIndex = buffer.firstIndex(of: 10) {
+                let line = Data(buffer[..<newlineIndex]).trimmingTrailingCarriageReturn()
+                buffer.removeSubrange(buffer.startIndex...newlineIndex)
+                return line
+            }
+
+            if reachedEnd {
+                guard !buffer.isEmpty else { return nil }
+                let line = buffer.trimmingTrailingCarriageReturn()
+                buffer.removeAll(keepingCapacity: false)
+                return line
+            }
+
+            let chunk = try handle.read(upToCount: 1_048_576) ?? Data()
+            if chunk.isEmpty {
+                reachedEnd = true
+            } else {
+                bytesRead += Int64(chunk.count)
+                buffer.append(chunk)
+            }
+        }
+    }
+}
+
+private final class GzipFastqLineReader {
+    private let filePath: String
+    private let process: Process
+    private let standardErrorPipe = Pipe()
+    private let standardError = PipeOutputBuffer()
+    private let lineReader: FastqLineReader
+
+    var bytesRead: Int64 { lineReader.bytesRead }
+
+    init(filePath: String, gzipURL: URL) throws {
+        self.filePath = filePath
+        self.process = Process()
+        let outputPipe = Pipe()
+        process.executableURL = gzipURL
+        process.arguments = ["-dc", filePath]
+        process.standardOutput = outputPipe
+        process.standardError = standardErrorPipe
+        lineReader = FastqLineReader(handle: outputPipe.fileHandleForReading)
+        standardErrorPipe.fileHandleForReading.readabilityHandler = { [standardError] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            standardError.append(data)
+        }
+        try process.run()
+    }
+
+    deinit {
+        standardErrorPipe.fileHandleForReading.readabilityHandler = nil
+        if process.isRunning {
+            process.terminate()
+        }
+    }
+
+    func nextLine() throws -> Data? {
+        try lineReader.nextLine()
+    }
+
+    func finish() throws {
+        process.waitUntilExit()
+        standardErrorPipe.fileHandleForReading.readabilityHandler = nil
+        let remaining = standardErrorPipe.fileHandleForReading.readDataToEndOfFile()
+        if !remaining.isEmpty {
+            standardError.append(remaining)
+        }
+        guard process.terminationStatus == 0 else {
+            let message = standardError.stringValue().trimmingCharacters(in: .whitespacesAndNewlines)
+            throw RNASeqAnalysisError.gzipFailed(
+                file: filePath,
+                message: message.isEmpty ? "exit code \(process.terminationStatus)" : message
+            )
+        }
+    }
+}
+
+private enum RNASeqFastqConverter {
+    static func convert(
+        inputFiles: [String],
+        outputURL: URL,
+        gzipURL: URL?,
+        progress: @escaping @Sendable (RNASeqConversionProgress) -> Void
+    ) throws -> Int64 {
+        let fileManager = FileManager.default
+        let usesGzip = inputFiles.contains(where: isGzipFASTQ)
+        let totalBytes = inputFiles.reduce(Int64(0)) { total, path in
+            let size = (try? fileManager.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0
+            return total + size
+        }
+
+        fileManager.createFile(atPath: outputURL.path, contents: nil)
+        let outputHandle = try FileHandle(forWritingTo: outputURL)
+        defer { try? outputHandle.close() }
+
+        var processedBeforeCurrentFile: Int64 = 0
+        var convertedReads: Int64 = 0
+        var fastaOutputBytes: Int64 = 0
+        var lastProgressBytes: Int64 = -1
+
+        for inputFile in inputFiles {
+            let inputURL = URL(fileURLWithPath: inputFile)
+            let fileSize = (try? fileManager.attributesOfItem(atPath: inputFile)[.size] as? NSNumber)?.int64Value ?? 0
+            let gzipReader: GzipFastqLineReader?
+            let plainReader: FastqLineReader?
+            if isGzipFASTQ(inputFile) {
+                guard let gzipURL else { throw RNASeqAnalysisError.gzipUnavailable }
+                gzipReader = try GzipFastqLineReader(filePath: inputFile, gzipURL: gzipURL)
+                plainReader = nil
+            } else {
+                gzipReader = nil
+                plainReader = try FastqLineReader(url: inputURL)
+            }
+            var recordIndex = 0
+
+            func nextLine() throws -> Data? {
+                if let gzipReader {
+                    return try gzipReader.nextLine()
+                }
+                return try plainReader?.nextLine()
+            }
+
+            func readerBytesRead() -> Int64 {
+                if let gzipReader {
+                    return gzipReader.bytesRead
+                }
+                return plainReader?.bytesRead ?? 0
+            }
+
+            while let headerLine = try nextLine() {
+                recordIndex += 1
+                let sequenceLineNumber = (recordIndex - 1) * 4 + 2
+                guard let sequenceLine = try nextLine() else {
+                    throw RNASeqAnalysisError.malformedFASTQ(file: inputFile, line: sequenceLineNumber, reason: "missing sequence line")
+                }
+                guard let plusLine = try nextLine() else {
+                    throw RNASeqAnalysisError.malformedFASTQ(file: inputFile, line: sequenceLineNumber + 1, reason: "missing plus line")
+                }
+                guard try nextLine() != nil else {
+                    throw RNASeqAnalysisError.malformedFASTQ(file: inputFile, line: sequenceLineNumber + 2, reason: "missing quality line")
+                }
+                guard headerLine.first == 64 else {
+                    throw RNASeqAnalysisError.malformedFASTQ(file: inputFile, line: sequenceLineNumber - 1, reason: "header does not start with @")
+                }
+                guard plusLine.first == 43 else {
+                    throw RNASeqAnalysisError.malformedFASTQ(file: inputFile, line: sequenceLineNumber + 1, reason: "separator does not start with +")
+                }
+
+                var header = headerLine
+                header.removeFirst()
+                if header.isEmpty {
+                    header = Data("read_\(convertedReads + 1)".utf8)
+                }
+
+                var fastaRecord = Data(capacity: header.count + sequenceLine.count + 4)
+                fastaRecord.append(62)
+                fastaRecord.append(header)
+                fastaRecord.append(10)
+                fastaRecord.append(sequenceLine)
+                fastaRecord.append(10)
+                try outputHandle.write(contentsOf: fastaRecord)
+                fastaOutputBytes += Int64(fastaRecord.count)
+
+                convertedReads += 1
+                let processedBytes = usesGzip
+                    ? min(processedBeforeCurrentFile, totalBytes)
+                    : min(processedBeforeCurrentFile + readerBytesRead(), totalBytes)
+                let progressBytes = usesGzip ? fastaOutputBytes : processedBytes
+                if lastProgressBytes < 0 || progressBytes - lastProgressBytes >= 64 * 1_024 * 1_024 {
+                    lastProgressBytes = progressBytes
+                    let statusProcessedBytes = isGzipFASTQ(inputFile) ? processedBeforeCurrentFile : processedBytes
+                    progress(
+                        RNASeqConversionProgress(
+                            currentFilePath: inputFile,
+                            totalInputBytes: totalBytes,
+                            processedInputBytes: statusProcessedBytes,
+                            convertedReads: convertedReads,
+                            outputBytes: fastaOutputBytes,
+                            isDeterminate: !usesGzip
+                        )
+                    )
+                }
+            }
+
+            try gzipReader?.finish()
+            processedBeforeCurrentFile += fileSize
+            progress(
+                RNASeqConversionProgress(
+                    currentFilePath: inputFile,
+                    totalInputBytes: totalBytes,
+                    processedInputBytes: min(processedBeforeCurrentFile, totalBytes),
+                    convertedReads: convertedReads,
+                    outputBytes: fastaOutputBytes,
+                    isDeterminate: !usesGzip
+                )
+            )
+        }
+
+        return convertedReads
+    }
+
+    static func isGzipFASTQ(_ path: String) -> Bool {
+        let lower = path.lowercased()
+        return lower.hasSuffix(".fq.gz") || lower.hasSuffix(".fastq.gz")
+    }
+}
+
+private extension Data {
+    func trimmingTrailingCarriageReturn() -> Data {
+        guard last == 13 else { return self }
+        return Data(dropLast())
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var section: WorkspaceSection = .run
@@ -407,11 +796,16 @@ final class AppModel: ObservableObject {
             preferences.save()
             configuration.databaseDirectory = preferences.databaseDirectory
             ensureDefaultOutputPath()
+            ensureDefaultRNASeqOutputPath()
             updateCommandPreview()
+            updateRNASeqCommandPreview()
         }
     }
     @Published var configuration: BlastSearchConfiguration {
         didSet { updateCommandPreview() }
+    }
+    @Published var rnaSeqConfiguration: RNASeqAnalysisConfiguration {
+        didSet { updateRNASeqCommandPreview() }
     }
     @Published var databaseCatalog: [BlastDatabaseEntry] = FallbackDatabaseCatalog.entries
     @Published var installedDatabaseSummary = InstalledDatabaseSummary()
@@ -419,12 +813,16 @@ final class AppModel: ObservableObject {
     @Published var databaseSearchText = ""
     @Published var databaseLog = ""
     @Published var runLog = ""
+    @Published var rnaSeqLog = ""
     @Published var helpText = ""
     @Published var commandPreview = ""
+    @Published var rnaSeqCommandPreview = ""
     @Published var isRunningSearch = false
+    @Published var isRunningRNASeq = false
     @Published var isRefreshingCatalog = false
     @Published var isDownloading = false
     @Published var downloadProgress = DownloadProgressSnapshot()
+    @Published var rnaSeqProgress = RNASeqProgressSnapshot()
     @Published var toolStatuses: [ToolStatus] = []
     @Published var jobs: [BlastJobRecord] = []
     @Published var customDatabaseInput = ""
@@ -436,6 +834,7 @@ final class AppModel: ObservableObject {
     private var downloadProgressBaseline = DownloadDirectoryScan()
     private var downloadProgressDirectory = ""
     private var downloadProgressNames: [String] = []
+    private var rnaSeqProgressTask: Task<Void, Never>?
 
     init() {
         let preferences = BlastPreferences.load()
@@ -445,9 +844,17 @@ final class AppModel: ObservableObject {
             databaseName: RecommendedBlastDatabases.blastn,
             databaseDirectory: preferences.databaseDirectory
         )
+        self.rnaSeqConfiguration = RNASeqAnalysisConfiguration(
+            databaseName: "refseq_rna",
+            outputPath: URL(fileURLWithPath: preferences.outputDirectory)
+                .appendingPathComponent("rnaseq-annotations.tsv")
+                .path
+        )
         ensureDefaultOutputPath()
+        ensureDefaultRNASeqOutputPath()
         markInstalledDatabases()
         updateCommandPreview()
+        updateRNASeqCommandPreview()
     }
 
     func bootstrap() async {
@@ -477,6 +884,14 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func ensureDefaultRNASeqOutputPath() {
+        if rnaSeqConfiguration.outputPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            rnaSeqConfiguration.outputPath = URL(fileURLWithPath: preferences.outputDirectory)
+                .appendingPathComponent("rnaseq-annotations.tsv")
+                .path
+        }
+    }
+
     func setProgram(_ program: BlastProgram) {
         configuration.program = program
         configuration.resetOptionsForProgram()
@@ -488,6 +903,12 @@ final class AppModel: ObservableObject {
         }
         ensureDefaultOutputPath()
         updateCommandPreview()
+    }
+
+    func setRNASeqProgram(_ program: BlastProgram) {
+        rnaSeqConfiguration.program = program
+        rnaSeqConfiguration.databaseName = preferredRNASeqDatabaseName(for: program)
+        updateRNASeqCommandPreview()
     }
 
     func updateCommandPreview() {
@@ -502,6 +923,83 @@ final class AppModel: ObservableObject {
         } catch {
             commandPreview = error.localizedDescription
         }
+    }
+
+    func updateRNASeqCommandPreview() {
+        let queryPath = rnaSeqConfiguration.inputFiles.isEmpty ? "<converted-rnaseq.fasta>" : "<streamed-fastq-as-fasta>"
+        do {
+            rnaSeqCommandPreview = try buildRNASeqBlastCommand(queryPath: queryPath).preview
+        } catch {
+            rnaSeqCommandPreview = error.localizedDescription
+        }
+    }
+
+    func addRNASeqInputFiles(_ paths: [String]) {
+        let existing = Set(rnaSeqConfiguration.inputFiles)
+        let additions = paths.filter { !existing.contains($0) }
+        rnaSeqConfiguration.inputFiles.append(contentsOf: additions)
+    }
+
+    func removeRNASeqInputFile(_ path: String) {
+        rnaSeqConfiguration.inputFiles.removeAll { $0 == path }
+    }
+
+    func clearRNASeqInputFiles() {
+        rnaSeqConfiguration.inputFiles.removeAll()
+    }
+
+    private func preferredRNASeqDatabaseName(for program: BlastProgram) -> String {
+        let preferredNames: [String]
+        switch program {
+        case .blastn:
+            preferredNames = ["refseq_rna", "tsa_nt", "est", RecommendedBlastDatabases.blastn]
+        case .blastx:
+            preferredNames = ["refseq_protein", RecommendedBlastDatabases.blastp, "nr", "swissprot"]
+        default:
+            preferredNames = [program.recommendedDatabaseName].compactMap { $0 }
+        }
+
+        let matchingKind = databaseCatalog
+            .filter { $0.kind == program.databaseKind }
+            .sorted(by: databaseEntrySort)
+        for name in preferredNames where matchingKind.contains(where: { $0.name == name }) {
+            return name
+        }
+        return matchingKind.first?.name ?? preferredNames.first ?? ""
+    }
+
+    private func buildRNASeqBlastCommand(queryPath: String) throws -> BlastCommand {
+        guard !rnaSeqConfiguration.inputFiles.isEmpty || queryPath.hasPrefix("<") else {
+            throw RNASeqAnalysisError.noInputFiles
+        }
+        guard !rnaSeqConfiguration.databaseName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RNASeqAnalysisError.missingDatabase
+        }
+        guard !rnaSeqConfiguration.outputPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RNASeqAnalysisError.missingOutputPath
+        }
+        guard !rnaSeqConfiguration.outputFieldString.isEmpty else {
+            throw RNASeqAnalysisError.noOutputFields
+        }
+
+        var optionValues = BlastParameterCatalog.defaultValues(for: rnaSeqConfiguration.program)
+        optionValues["evalue"] = rnaSeqConfiguration.evalue
+        optionValues["maxTargetSeqs"] = rnaSeqConfiguration.maxTargetSequences
+        optionValues["numThreads"] = rnaSeqConfiguration.numThreads
+        optionValues["outfmt"] = "6 \(rnaSeqConfiguration.outputFieldString)"
+        if rnaSeqConfiguration.program == .blastn {
+            optionValues["task"] = rnaSeqConfiguration.blastnTask
+        }
+
+        let blastConfiguration = BlastSearchConfiguration(
+            program: rnaSeqConfiguration.program,
+            databaseName: rnaSeqConfiguration.databaseName,
+            databaseDirectory: preferences.databaseDirectory,
+            outputPath: rnaSeqConfiguration.outputPath,
+            optionValues: optionValues,
+            rawArguments: rnaSeqConfiguration.rawArguments
+        )
+        return try BlastCommandBuilder.build(configuration: blastConfiguration, queryPath: queryPath)
     }
 
     func refreshTools() async {
@@ -952,6 +1450,199 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func runRNASeqAnalysis() async {
+        guard let executable = ProcessClient.resolveExecutable(named: rnaSeqConfiguration.program.executableName, preferences: preferences) else {
+            rnaSeqLog = LocalBlastError.toolMissing(rnaSeqConfiguration.program.executableName).localizedDescription
+            return
+        }
+
+        ensureWorkingDirectories()
+        ensureDefaultRNASeqOutputPath()
+        let outputPath = rnaSeqConfiguration.outputPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let outputURL = URL(fileURLWithPath: outputPath)
+        let outputDirectory = outputURL.deletingLastPathComponent()
+        let inputFiles = rnaSeqConfiguration.inputFiles
+        let keepConvertedFasta = rnaSeqConfiguration.keepConvertedFasta
+        let needsGzip = inputFiles.contains(where: RNASeqFastqConverter.isGzipFASTQ)
+        let gzipURL = needsGzip ? ProcessClient.resolveExecutable(named: "gzip", preferences: preferences) : nil
+
+        do {
+            guard !inputFiles.isEmpty else { throw RNASeqAnalysisError.noInputFiles }
+            if needsGzip, gzipURL == nil {
+                throw RNASeqAnalysisError.gzipUnavailable
+            }
+            guard !rnaSeqConfiguration.databaseName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw RNASeqAnalysisError.missingDatabase
+            }
+            guard !outputPath.isEmpty else { throw RNASeqAnalysisError.missingOutputPath }
+            guard !rnaSeqConfiguration.outputFieldString.isEmpty else { throw RNASeqAnalysisError.noOutputFields }
+            do {
+                try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+            } catch {
+                throw RNASeqAnalysisError.cannotCreateOutputDirectory(outputDirectory.path)
+            }
+
+            isRunningRNASeq = true
+            rnaSeqLog = "Preparing RNA-Seq annotation."
+            let startedAt = Date()
+            let totalBytes = totalFileSize(paths: inputFiles)
+            rnaSeqProgress = RNASeqProgressSnapshot(
+                hasActivity: true,
+                isActive: true,
+                stage: .preparing,
+                status: "Preparing FASTQ inputs",
+                inputFileCount: inputFiles.count,
+                totalInputBytes: totalBytes,
+                startedAt: startedAt,
+                lastUpdated: Date()
+            )
+
+            let convertedFastaURL = outputDirectory.appendingPathComponent(
+                "\(outputURL.deletingPathExtension().lastPathComponent)-converted-\(UUID().uuidString).fasta"
+            )
+
+            rnaSeqLog = "Converting \(inputFiles.count) FASTQ file(s) to FASTA: \(convertedFastaURL.path)"
+            let convertedReads = try await Task.detached { [weak self, inputFiles, convertedFastaURL, gzipURL] in
+                try RNASeqFastqConverter.convert(inputFiles: inputFiles, outputURL: convertedFastaURL, gzipURL: gzipURL) { progress in
+                    Task { @MainActor in
+                        self?.applyRNASeqConversionProgress(progress)
+                    }
+                }
+            }.value
+
+            let command = try buildRNASeqBlastCommand(queryPath: convertedFastaURL.path)
+            rnaSeqCommandPreview = command.preview
+            rnaSeqLog = "Running \(command.preview)"
+            startRNASeqOutputMonitor(outputPath: outputPath, convertedReads: convertedReads)
+            let result = try await Task.detached {
+                try ProcessClient.runSync(
+                    executableURL: executable,
+                    arguments: command.arguments,
+                    environment: command.environment
+                )
+            }.value
+            stopRNASeqProgressMonitor()
+
+            if !keepConvertedFasta {
+                try? FileManager.default.removeItem(at: convertedFastaURL)
+            }
+
+            let outputBytes = fileSize(path: outputPath)
+            let logText = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            rnaSeqLog = logText.isEmpty
+                ? "RNA-Seq annotation finished with exit code \(result.exitCode)."
+                : logText
+            rnaSeqProgress = RNASeqProgressSnapshot(
+                hasActivity: true,
+                isActive: false,
+                stage: result.exitCode == 0 ? .finished : .failed,
+                status: result.exitCode == 0 ? "Annotation finished" : "BLAST exited with code \(result.exitCode)",
+                inputFileCount: inputFiles.count,
+                totalInputBytes: totalBytes,
+                processedInputBytes: totalBytes,
+                convertedReads: convertedReads,
+                outputBytes: outputBytes,
+                startedAt: startedAt,
+                lastUpdated: Date()
+            )
+            jobs.insert(
+                BlastJobRecord(
+                    program: rnaSeqConfiguration.program,
+                    database: rnaSeqConfiguration.databaseName,
+                    outputPath: outputPath,
+                    commandPreview: command.preview,
+                    exitCode: result.exitCode,
+                    date: Date()
+                ),
+                at: 0
+            )
+        } catch {
+            stopRNASeqProgressMonitor()
+            rnaSeqLog = error.localizedDescription
+            var snapshot = rnaSeqProgress
+            snapshot.hasActivity = true
+            snapshot.isActive = false
+            snapshot.stage = .failed
+            snapshot.status = error.localizedDescription
+            snapshot.lastUpdated = Date()
+            rnaSeqProgress = snapshot
+        }
+
+        isRunningRNASeq = false
+    }
+
+    private func applyRNASeqConversionProgress(_ progress: RNASeqConversionProgress) {
+        let startedAt = rnaSeqProgress.startedAt ?? Date()
+        rnaSeqProgress = RNASeqProgressSnapshot(
+            hasActivity: true,
+            isActive: true,
+            stage: .converting,
+            status: "Converting FASTQ to FASTA",
+            inputFileCount: rnaSeqConfiguration.inputFiles.count,
+            currentFileName: URL(fileURLWithPath: progress.currentFilePath).lastPathComponent,
+            totalInputBytes: progress.totalInputBytes,
+            processedInputBytes: progress.processedInputBytes,
+            convertedReads: progress.convertedReads,
+            outputBytes: progress.outputBytes,
+            isConversionProgressDeterminate: progress.isDeterminate,
+            startedAt: startedAt,
+            lastUpdated: Date()
+        )
+    }
+
+    private func startRNASeqOutputMonitor(outputPath: String, convertedReads: Int64) {
+        rnaSeqProgressTask?.cancel()
+        let startedAt = rnaSeqProgress.startedAt ?? Date()
+        let totalBytes = rnaSeqProgress.totalInputBytes
+        let inputFileCount = rnaSeqProgress.inputFileCount
+        rnaSeqProgress = RNASeqProgressSnapshot(
+            hasActivity: true,
+            isActive: true,
+            stage: .annotating,
+            status: "Annotating reads with BLAST",
+            inputFileCount: inputFileCount,
+            totalInputBytes: totalBytes,
+            processedInputBytes: totalBytes,
+            convertedReads: convertedReads,
+            outputBytes: fileSize(path: outputPath),
+            startedAt: startedAt,
+            lastUpdated: Date()
+        )
+
+        rnaSeqProgressTask = Task { [weak self, outputPath] in
+            while !Task.isCancelled {
+                let outputBytes = Self.fileSize(path: outputPath)
+                await MainActor.run {
+                    guard let self else { return }
+                    var snapshot = self.rnaSeqProgress
+                    snapshot.outputBytes = outputBytes
+                    snapshot.lastUpdated = Date()
+                    self.rnaSeqProgress = snapshot
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func stopRNASeqProgressMonitor() {
+        rnaSeqProgressTask?.cancel()
+        rnaSeqProgressTask = nil
+    }
+
+    private func totalFileSize(paths: [String]) -> Int64 {
+        paths.reduce(Int64(0)) { total, path in
+            total + Self.fileSize(path: path)
+        }
+    }
+
+    private static func fileSize(path: String) -> Int64 {
+        (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0
+    }
+
+    private func fileSize(path: String) -> Int64 {
+        Self.fileSize(path: path)
+    }
+
     func runSearch() async {
         guard let executable = ProcessClient.resolveExecutable(named: configuration.program.executableName, preferences: preferences) else {
             runLog = LocalBlastError.toolMissing(configuration.program.executableName).localizedDescription
@@ -1062,6 +1753,8 @@ struct RootView: View {
             switch model.section {
             case .run:
                 RunBlastView()
+            case .rnaSeq:
+                RNASeqView()
             case .databases:
                 DatabasesView()
             case .tools:
@@ -1449,9 +2142,7 @@ struct SequenceTextEditor: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(Color.accentColor.opacity(0.45), lineWidth: 1.5)
 
-            TextEditor(text: $text)
-                .font(.system(.body, design: .monospaced))
-                .scrollContentBackground(.hidden)
+            SequencePlainTextView(text: $text)
                 .padding(6)
 
             if text.isEmpty {
@@ -1463,6 +2154,457 @@ struct SequenceTextEditor: View {
             }
         }
         .frame(minHeight: 160)
+    }
+}
+
+struct SequencePlainTextView: NSViewRepresentable {
+    @Binding var text: String
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.borderType = .noBorder
+
+        let textView = NSTextView()
+        textView.delegate = context.coordinator
+        textView.string = text
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.allowsUndo = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 4, height: 6)
+        textView.font = Self.sequenceFont
+        textView.defaultParagraphStyle = Self.sequenceParagraphStyle
+        textView.typingAttributes = Self.typingAttributes
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isContinuousSpellCheckingEnabled = false
+        textView.isGrammarCheckingEnabled = false
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.heightTracksTextView = false
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.lineBreakMode = .byCharWrapping
+        applySequenceAttributes(to: textView)
+
+        scrollView.documentView = textView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        if textView.string != text {
+            textView.string = text
+        }
+        textView.font = Self.sequenceFont
+        textView.defaultParagraphStyle = Self.sequenceParagraphStyle
+        textView.typingAttributes = Self.typingAttributes
+        textView.textContainer?.lineBreakMode = .byCharWrapping
+        applySequenceAttributes(to: textView)
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+
+    private static var sequenceFont: NSFont {
+        NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+    }
+
+    private static var sequenceParagraphStyle: NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byCharWrapping
+        style.hyphenationFactor = 0
+        return style
+    }
+
+    private static var typingAttributes: [NSAttributedString.Key: Any] {
+        [
+            .font: sequenceFont,
+            .paragraphStyle: sequenceParagraphStyle
+        ]
+    }
+
+    private func applySequenceAttributes(to textView: NSTextView) {
+        let length = (textView.string as NSString).length
+        guard length > 0 else { return }
+        textView.textStorage?.addAttributes(Self.typingAttributes, range: NSRange(location: 0, length: length))
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        @Binding var text: String
+
+        init(text: Binding<String>) {
+            _text = text
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            text = textView.string
+        }
+    }
+}
+
+struct RNASeqView: View {
+    @EnvironmentObject private var model: AppModel
+
+    private let supportedPrograms: [BlastProgram] = [.blastn, .blastx]
+
+    private var availableDatabases: [BlastDatabaseEntry] {
+        model.databaseCatalog
+            .filter { $0.kind == model.rnaSeqConfiguration.program.databaseKind }
+            .sorted(by: databaseEntrySort)
+    }
+
+    private var inputSize: Int64 {
+        model.rnaSeqConfiguration.inputFiles.reduce(Int64(0)) { total, path in
+            total + fileSize(path: path)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HeaderBar(
+                title: "RNA-Seq Annotation",
+                subtitle: "Stream large trimmed and merged FASTQ files into local BLAST annotation jobs."
+            ) { }
+
+            GeometryReader { proxy in
+                if proxy.size.width < 1050 {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            mainColumn
+                            sideColumn
+                        }
+                        .padding(20)
+                    }
+                } else {
+                    HStack(spacing: 0) {
+                        ScrollView {
+                            mainColumn
+                                .padding(20)
+                        }
+                        .frame(minWidth: 0, maxWidth: .infinity)
+
+                        Divider()
+
+                        ScrollView {
+                            sideColumn
+                                .padding(20)
+                        }
+                        .frame(width: min(max(proxy.size.width * 0.38, 420), 620))
+                    }
+                }
+            }
+        }
+    }
+
+    private var mainColumn: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            inputPanel
+            searchPanel
+            outputSpecPanel
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var sideColumn: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            progressPanel
+            commandPanel
+            logPanel
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var inputPanel: some View {
+        Panel(title: "FASTQ Inputs", systemImage: "doc.on.doc") {
+            HStack {
+                Button {
+                    let paths = OpenPanel.chooseFiles(allowedExtensions: ["fq", "fastq", "gz", "txt"])
+                    model.addRNASeqInputFiles(paths)
+                } label: {
+                    Label("Add FASTQ Files", systemImage: "plus")
+                }
+                Button {
+                    model.clearRNASeqInputFiles()
+                } label: {
+                    Label("Clear", systemImage: "xmark.circle")
+                }
+                .disabled(model.rnaSeqConfiguration.inputFiles.isEmpty || model.isRunningRNASeq)
+                Spacer()
+                Text(byteLabel(inputSize))
+                    .foregroundStyle(.secondary)
+            }
+
+            List(model.rnaSeqConfiguration.inputFiles, id: \.self) { path in
+                HStack(spacing: 10) {
+                    Image(systemName: "doc.text")
+                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(URL(fileURLWithPath: path).lastPathComponent)
+                            .font(.headline)
+                            .lineLimit(1)
+                        Text(path)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                    Spacer()
+                    Text(byteLabel(fileSize(path: path)))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button {
+                        model.removeRNASeqInputFile(path)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.isRunningRNASeq)
+                }
+                .padding(.vertical, 3)
+            }
+            .frame(minHeight: 160)
+            .overlay {
+                if model.rnaSeqConfiguration.inputFiles.isEmpty {
+                    ContentUnavailableView("No FASTQ files selected", systemImage: "doc.badge.plus")
+                }
+            }
+        }
+    }
+
+    private var searchPanel: some View {
+        Panel(title: "Annotation Search", systemImage: "scope") {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 8)], alignment: .leading, spacing: 8) {
+                ForEach(supportedPrograms) { program in
+                    ProgramChoiceButton(
+                        program: program,
+                        isSelected: model.rnaSeqConfiguration.program == program
+                    ) {
+                        model.setRNASeqProgram(program)
+                    }
+                }
+            }
+
+            Picker("Catalog database", selection: $model.rnaSeqConfiguration.databaseName) {
+                ForEach(availableDatabases) { database in
+                    Text("\(database.name)\(database.isInstalled ? "" : " - not installed")")
+                        .tag(database.name)
+                }
+            }
+            TextField("Database name or path", text: $model.rnaSeqConfiguration.databaseName)
+                .textFieldStyle(.roundedBorder)
+
+            HStack {
+                TextField("Database directory", text: $model.preferences.databaseDirectory)
+                Button {
+                    if let path = OpenPanel.chooseDirectory() {
+                        model.preferences.databaseDirectory = path
+                        model.markInstalledDatabases()
+                    }
+                } label: {
+                    Image(systemName: "folder")
+                }
+                .help("Choose the BLASTDB directory.")
+            }
+
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                if model.rnaSeqConfiguration.program == .blastn {
+                    GridRow {
+                        Text("BLASTN task")
+                            .frame(width: 150, alignment: .leading)
+                        Picker("BLASTN task", selection: $model.rnaSeqConfiguration.blastnTask) {
+                            Text("blastn").tag("blastn")
+                            Text("megablast").tag("megablast")
+                            Text("dc-megablast").tag("dc-megablast")
+                        }
+                        .labelsHidden()
+                    }
+                }
+                GridRow {
+                    Text("E-value")
+                        .frame(width: 150, alignment: .leading)
+                    TextField("1e-5", text: $model.rnaSeqConfiguration.evalue)
+                        .textFieldStyle(.roundedBorder)
+                }
+                GridRow {
+                    Text("Max hits/read")
+                        .frame(width: 150, alignment: .leading)
+                    TextField("10", text: $model.rnaSeqConfiguration.maxTargetSequences)
+                        .textFieldStyle(.roundedBorder)
+                }
+                GridRow {
+                    Text("CPU threads")
+                        .frame(width: 150, alignment: .leading)
+                    TextField("4", text: $model.rnaSeqConfiguration.numThreads)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+        }
+    }
+
+    private var outputSpecPanel: some View {
+        Panel(title: "Output Specification", systemImage: "tablecells") {
+            HStack {
+                TextField("Output TSV file", text: $model.rnaSeqConfiguration.outputPath)
+                Button {
+                    if let path = OpenPanel.saveFile(defaultName: "rnaseq-annotations.tsv") {
+                        model.rnaSeqConfiguration.outputPath = path
+                    }
+                } label: {
+                    Image(systemName: "square.and.arrow.down")
+                }
+            }
+
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 8)], alignment: .leading, spacing: 8) {
+                ForEach(RNASeqOutputField.allCases) { field in
+                    Toggle(field.label, isOn: Binding(
+                        get: { model.rnaSeqConfiguration.outputFields.contains(field) },
+                        set: { selected in
+                            if selected {
+                                model.rnaSeqConfiguration.outputFields.insert(field)
+                            } else {
+                                model.rnaSeqConfiguration.outputFields.remove(field)
+                            }
+                        }
+                    ))
+                    .toggleStyle(.checkbox)
+                }
+            }
+
+            LabeledContent("BLAST outfmt 6") {
+                Text(model.rnaSeqConfiguration.outputFieldString.isEmpty ? "No fields selected" : model.rnaSeqConfiguration.outputFieldString)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Toggle("Keep converted FASTA beside the output", isOn: $model.rnaSeqConfiguration.keepConvertedFasta)
+            TextField("Raw BLAST+ arguments", text: $model.rnaSeqConfiguration.rawArguments)
+                .textFieldStyle(.roundedBorder)
+        }
+    }
+
+    private var progressPanel: some View {
+        let progress = model.rnaSeqProgress
+        return Panel(title: "Progress", systemImage: "chart.bar") {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(progress.stage.rawValue)
+                        .font(.headline)
+                    Text(progress.status)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if progress.isActive {
+                    Label("Active", systemImage: "bolt.fill")
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                }
+            }
+
+            if let fraction = progress.fractionComplete {
+                ProgressView(value: fraction)
+                Text("\(percentLabel(fraction)) complete")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if progress.isActive {
+                ProgressView()
+            } else {
+                ProgressView(value: 0)
+            }
+
+            HStack(spacing: 16) {
+                SummaryMetric(label: "Input", value: byteLabel(progress.totalInputBytes))
+                SummaryMetric(label: "Processed", value: byteLabel(progress.processedInputBytes))
+                SummaryMetric(label: "Reads", value: countLabel(progress.convertedReads))
+                SummaryMetric(label: "Output", value: byteLabel(progress.outputBytes))
+            }
+
+            if !progress.currentFileName.isEmpty {
+                Label(progress.currentFileName, systemImage: "doc.text")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Label(durationLabel(progress.elapsed), systemImage: "clock")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var commandPanel: some View {
+        Panel(title: "Command Preview", systemImage: "chevron.left.forwardslash.chevron.right") {
+            ScrollView(.horizontal) {
+                Text(model.rnaSeqCommandPreview)
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Button {
+                Task { await model.runRNASeqAnalysis() }
+            } label: {
+                Label(model.isRunningRNASeq ? "Annotating" : "Start Annotation", systemImage: "play.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(model.isRunningRNASeq)
+        }
+    }
+
+    private var logPanel: some View {
+        Panel(title: "RNA-Seq Log", systemImage: "text.bubble") {
+            ScrollView {
+                Text(model.rnaSeqLog.isEmpty ? "No RNA-Seq annotation started." : model.rnaSeqLog)
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(minHeight: 160)
+        }
+    }
+
+    private func fileSize(path: String) -> Int64 {
+        (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0
+    }
+
+    private func byteLabel(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    private func countLabel(_ value: Int64) -> String {
+        value.formatted()
+    }
+
+    private func percentLabel(_ fraction: Double) -> String {
+        let percent = min(max(fraction * 100, 0), 100)
+        return percent >= 10
+            ? String(format: "%.0f%%", percent)
+            : String(format: "%.1f%%", percent)
+    }
+
+    private func durationLabel(_ seconds: TimeInterval) -> String {
+        let totalSeconds = max(Int(seconds.rounded()), 0)
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        }
+        if minutes > 0 {
+            return "\(minutes)m \(seconds)s"
+        }
+        return "\(seconds)s"
     }
 }
 
@@ -2077,6 +3219,19 @@ enum OpenPanel {
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = allowedExtensions.compactMap { UTType(filenameExtension: $0) }
         return panel.runModal() == .OK ? panel.url?.path : nil
+    }
+
+    @MainActor
+    static func chooseFiles(allowedExtensions: [String]) -> [String] {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        let contentTypes = allowedExtensions.compactMap { UTType(filenameExtension: $0) }
+        if !contentTypes.isEmpty {
+            panel.allowedContentTypes = contentTypes
+        }
+        return panel.runModal() == .OK ? panel.urls.map(\.path) : []
     }
 
     @MainActor

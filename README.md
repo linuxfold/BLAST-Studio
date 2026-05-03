@@ -13,6 +13,7 @@ The app is intentionally local-first. It does not contact NCBI on launch, and it
 - Runs local `blastn`, `blastp`, `blastx`, `tblastn`, `tblastx`, `psiblast`, `rpsblast`, `rpstblastn`, and `deltablast`.
 - Supports local database searches with downloaded BLAST databases such as `core_nt`, `nr_cluster_seq`, `nt`, `nr`, `refseq_protein`, and `refseq_rna`.
 - Supports pairwise sequence comparison with **Align two sequences**, using BLAST+'s `-subject` mode instead of a database.
+- Adds an **RNA-Seq** annotation workspace for trimmed/merged `.fq`, `.fastq`, `.fq.gz`, or `.fastq.gz` inputs, including multi-file selection, database choice, output-field selection, and staged progress.
 - Provides website-style controls for common BLAST parameters: task, E-value, max target sequences, word size, scoring, filters, masking, output format, genetic code, ranges, and PSI-BLAST settings.
 - Provides a raw advanced-arguments field, appended last, for BLAST+ switches that are not yet represented by structured controls.
 - Discovers downloadable NCBI database names with `update_blastdb.pl --showall` when requested.
@@ -112,6 +113,17 @@ blastn -query query.fasta -db core_nt -out result.txt -task megablast
 ```
 
 The app sets `BLASTDB` for the BLAST process and also passes the selected database path directly.
+
+## Annotating Trimmed RNA-Seq FASTQ
+
+Open **RNA-Seq** to annotate one or more trimmed and merged FASTQ files against a local BLAST database.
+
+1. Add one or more `.fq`, `.fastq`, `.fq.gz`, or `.fastq.gz` files.
+2. Choose `BLASTN` for nucleotide/transcript databases such as `refseq_rna`, or `BLASTX` for translated searches against protein databases.
+3. Pick or type the database name, choose the output `.tsv`, and select the BLAST tabular fields to include.
+4. Start annotation.
+
+The RNA-Seq workflow streams FASTQ records to a temporary FASTA file in the output folder, runs BLAST against that FASTA, then removes the converted FASTA unless **Keep converted FASTA beside the output** is enabled. Gzipped FASTQ inputs are streamed through `gzip -dc` and are not decompressed to a standalone `.fq` file first. For 7-30 GB FASTQ inputs, leave enough free space for the converted FASTA, the BLAST output, and BLAST temporary/runtime overhead.
 
 ## Comparing Two Sequences
 
