@@ -87,7 +87,7 @@ Create a universal Intel + Apple Silicon DMG:
 The DMG is created at:
 
 ```sh
-dist/BLAST-Studio-0.1.0-universal.dmg
+dist/BLAST-Studio-0.2.0-universal.dmg
 ```
 
 The DMG script builds separate `arm64` and `x86_64` release binaries, combines them with `lipo`, creates a drag-to-Applications disk image, and ad-hoc signs the app by default. It is not notarized. To sign with a Developer ID certificate, run it with `CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./scripts/package_dmg.sh`.
