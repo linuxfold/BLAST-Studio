@@ -14,6 +14,7 @@ The app is intentionally local-first. It does not contact NCBI on launch, and it
 - Supports local database searches with downloaded BLAST databases such as `core_nt`, `nr_cluster_seq`, `nt`, `nr`, `refseq_protein`, and `refseq_rna`.
 - Supports pairwise sequence comparison with **Align two sequences**, using BLAST+'s `-subject` mode instead of a database.
 - Adds an **RNA-Seq** annotation workspace for trimmed/merged `.fq`, `.fastq`, `.fq.gz`, or `.fastq.gz` inputs, including multi-file selection, database choice, output-field selection, and staged progress.
+- Adds a **Results** workspace that tracks multiple jobs, auto-loads saved `.txt`, `.tsv`, and `.out` reports, and renders BLAST descriptions, alignments, tabular rows, and raw output in a GUI.
 - Provides website-style controls for common BLAST parameters: task, E-value, max target sequences, word size, scoring, filters, masking, output format, genetic code, ranges, and PSI-BLAST settings.
 - Provides a raw advanced-arguments field, appended last, for BLAST+ switches that are not yet represented by structured controls.
 - Discovers downloadable NCBI database names with `update_blastdb.pl --showall` when requested.
@@ -101,6 +102,7 @@ The DMG script builds separate `arm64` and `x86_64` release binaries, combines t
 5. Click **Refresh Catalog** only when you want to fetch the latest downloadable list from NCBI.
 6. Start with `core_nt` for BLASTN and `nr_cluster_seq` for BLASTP, or select other databases and click **Download Selected**.
 7. Open **Run BLAST**, paste or choose a FASTA query, pick a database, set options, and run.
+8. Open **Results** to review completed jobs or load saved BLAST result files.
 
 ## Running A Database Search
 
@@ -124,6 +126,56 @@ Open **RNA-Seq** to annotate one or more trimmed and merged FASTQ files against 
 4. Start annotation.
 
 The RNA-Seq workflow streams FASTQ records to a temporary FASTA file in the output folder, runs BLAST against that FASTA, then removes the converted FASTA unless **Keep converted FASTA beside the output** is enabled. Gzipped FASTQ inputs are streamed through `gzip -dc` and are not decompressed to a standalone `.fq` file first. For 7-30 GB FASTQ inputs, leave enough free space for the converted FASTA, the BLAST output, and BLAST temporary/runtime overhead.
+
+## Choosing A Database
+
+BLAST database choice affects speed, disk use, and biological interpretation more than almost any other setting. The app highlights starter databases, but the right search set depends on the question.
+
+### Recommended Starters
+
+| Goal | Program | Recommended database | Why |
+|---|---|---|---|
+| Quick nucleotide ID or sanity check | `blastn` | `core_nt` | Smaller practical nucleotide starter set with broad coverage for common local searches. |
+| Broad nucleotide search | `blastn` | `nt` | Largest general nucleotide collection; use when `core_nt` is too narrow and you have the storage/time budget. |
+| Transcript or RNA-Seq annotation | `blastn` | `refseq_rna` | Curated transcript/reference RNA target set that is usually easier to interpret than all of `nt`. |
+| Assembled transcriptome reads | `blastn` | `tsa_nt` | Transcriptome Shotgun Assembly nucleotide records; useful when RefSeq RNA is too curated. |
+| 16S or bacterial marker checks | `blastn` | `16S_ribosomal_RNA` | Small, focused marker database that is fast and avoids unrelated nucleotide hits. |
+| Quick protein ID | `blastp` | `nr_cluster_seq` | Representative protein clusters from `nr`; much smaller and less redundant than full `nr`. |
+| Curated protein function | `blastp` or `blastx` | `swissprot` | Small, high-quality curated protein set; good first pass for clean functional labels. |
+| Reference protein annotation | `blastp` or `blastx` | `refseq_protein` | Larger curated/reference-style protein coverage than Swiss-Prot. |
+| Broadest protein search | `blastp` or `blastx` | `nr` | Full nonredundant protein set; slower and much larger, but broadest. |
+
+For most new installs, download `core_nt`, `nr_cluster_seq`, `refseq_rna`, `swissprot`, and `taxdb` first. Add larger databases only after you know which search family you actually need.
+
+### Search Strategy
+
+- Use the smallest database that can answer the question. Small focused databases are faster, easier to interpret, and less likely to bury the useful hit in generic matches.
+- Use `core_nt` before `nt` for nucleotide searches. Move to `nt` only when the target may be absent from the starter set.
+- Use `nr_cluster_seq` before `nr` for protein searches. Move to `nr` when cluster representatives are not enough or you need maximum legacy coverage.
+- Use `swissprot` before `nr` when the goal is functional annotation. Swiss-Prot may miss obscure sequences, but its labels are usually cleaner.
+- Use `refseq_rna` or `refseq_protein` when you want reference-style records rather than every submitted sequence.
+- Add `taxdb` if you need taxonomy names, taxonomy IDs, or better organism labels in reports.
+- Build a custom database with `makeblastdb` when searching against a species panel, lab reference set, plasmid collection, primer target set, or any known bounded sequence universe.
+
+### RNA-Seq Notes
+
+For RNA-Seq annotation, prefer a target database that matches the biological question:
+
+- `refseq_rna` for transcript-level nucleotide annotation.
+- `refseq_protein`, `swissprot`, or `nr_cluster_seq` with `blastx` when nucleotide reads should be translated and assigned to proteins.
+- Custom transcript/protein FASTA databases when you are validating against an organism-specific reference or expected construct set.
+
+RNA-Seq jobs can produce very large tabular outputs. Keep **Max hits/read** low until the pipeline is tuned, and increase **CPU threads** based on available cores and disk speed.
+
+### Performance Expectations
+
+The NCBI web service often feels much faster because it runs on optimized server infrastructure with hot databases, fast storage, and backend parallelism. Local BLAST speed depends on your CPU thread count, database size, disk speed, whether the database is already cached by macOS, and output format. If a local search is unexpectedly slow:
+
+- Increase **CPU threads** from the default if your machine has spare cores.
+- Try a smaller or more focused database.
+- Keep databases on fast local SSD storage rather than external or network disks.
+- Reduce **Max target sequences** while testing.
+- Prefer tabular output for large batch workflows; pairwise alignments are easier to read but more expensive to format.
 
 ## Comparing Two Sequences
 

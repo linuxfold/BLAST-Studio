@@ -63,6 +63,71 @@ do {
     let split = try BlastCommandBuilder.splitShellArguments(#"-outfmt "6 qacc sacc bitscore" -html"#)
     require(split == ["-outfmt", "6 qacc sacc bitscore", "-html"], "quoted raw args split incorrectly")
 
+    let pairwiseReportText = """
+    BLASTN 2.16.0+
+
+    Query= Query_1
+    Length=426
+
+    Database: core_nt
+               1,234 sequences; 5,678 total letters
+
+    Sequences producing significant alignments:                          Score     E
+    Subject_alpha hypothetical protein                                   751       0.0
+    Subject_beta predicted transcript                                    312       2e-80
+
+    >Subject_alpha hypothetical protein
+    Length=500
+     Score = 751 bits (406),  Expect = 0.0
+     Identities = 426/426 (100%), Gaps = 0/426 (0%)
+     Strand=Plus/Plus
+
+    Query  1    ACGT  4
+                ||||
+    Sbjct  2    ACGT  5
+
+    Lambda      K        H
+    """
+    let pairwiseReport = BlastResultParser.parse(pairwiseReportText)
+    require(pairwiseReport.format == .pairwise, "pairwise report format not detected")
+    require(pairwiseReport.program == "BLASTN 2.16.0+", "program line not parsed")
+    require(pairwiseReport.query == "Query_1", "query name not parsed")
+    require(pairwiseReport.queryLength == 426, "query length not parsed")
+    require(pairwiseReport.database == "core_nt", "database name not parsed")
+    require(pairwiseReport.hits.count == 2, "description hit table not parsed")
+    require(pairwiseReport.alignments.count == 1, "alignment block not parsed")
+    require(pairwiseReport.alignments[0].identities == "426/426 (100%)", "identity metric not parsed")
+
+    let databaseFirstReportText = """
+    BLASTN 2.16.0+
+
+    Database: core_nt
+               1,234 sequences; 5,678 total letters
+
+    Query= Query_1
+    Length=426
+
+    ***** No hits found *****
+
+    Lambda      K        H
+    """
+    let databaseFirstReport = BlastResultParser.parse(databaseFirstReportText)
+    require(databaseFirstReport.query == "Query_1", "database-first query name not parsed")
+    require(databaseFirstReport.queryLength == 426, "database-first query length not parsed")
+    require(databaseFirstReport.database == "core_nt", "database-first database name not parsed")
+    require(databaseFirstReport.noHits, "database-first no-hit report not detected")
+
+    let tabularReportText = """
+    # BLASTN 2.16.0+
+    # Fields: qseqid, sseqid, pident, length, mismatch, gapopen, qstart, qend, sstart, send, evalue, bitscore
+    Query_1\tSubject_alpha\t99.0\t426\t1\t0\t1\t426\t2\t427\t1e-120\t425
+    """
+    let tabularReport = BlastResultParser.parse(tabularReportText)
+    require(tabularReport.format == .tabular, "tabular report format not detected")
+    require(tabularReport.tabularRows.count == 1, "tabular row not parsed")
+    require(tabularReport.hits[0].accession == "Subject_alpha", "tabular subject not parsed")
+    require(tabularReport.hits[0].identity == "99.0%", "tabular identity not parsed")
+
     let showAll = """
     nr
     nt

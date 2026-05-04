@@ -27,9 +27,9 @@ struct LocalBlastStudioApp: App {
 enum WorkspaceSection: String, CaseIterable, Identifiable {
     case run = "Run BLAST"
     case rnaSeq = "RNA-Seq"
+    case results = "Results"
     case databases = "Databases"
     case tools = "Tools"
-    case jobs = "Jobs"
 
     var id: String { rawValue }
 
@@ -37,9 +37,9 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
         switch self {
         case .run: "play.circle"
         case .rnaSeq: "waveform.path.ecg"
+        case .results: "doc.text.magnifyingglass"
         case .databases: "internaldrive"
         case .tools: "wrench.and.screwdriver"
-        case .jobs: "clock.arrow.circlepath"
         }
     }
 }
@@ -89,14 +89,38 @@ struct ToolStatus: Identifiable, Hashable {
     var id: String { name }
 }
 
+enum BlastJobKind: String, Hashable {
+    case blastSearch = "BLAST Search"
+    case rnaSeq = "RNA-Seq"
+    case imported = "Imported Result"
+}
+
+enum BlastJobStatus: String, Hashable {
+    case running = "Running"
+    case finished = "Finished"
+    case failed = "Failed"
+    case imported = "Imported"
+}
+
 struct BlastJobRecord: Identifiable, Hashable {
     var id = UUID()
+    var kind: BlastJobKind = .blastSearch
+    var title: String = ""
     var program: BlastProgram
     var database: String
     var outputPath: String
     var commandPreview: String
-    var exitCode: Int32
+    var exitCode: Int32?
     var date: Date
+    var status: BlastJobStatus
+    var duration: TimeInterval?
+    var outputBytes: Int64 = 0
+    var hitCount: Int?
+    var noHits = false
+
+    var displayTitle: String {
+        title.isEmpty ? URL(fileURLWithPath: outputPath).lastPathComponent : title
+    }
 }
 
 enum RNASeqOutputField: String, CaseIterable, Codable, Hashable, Identifiable, Sendable {
@@ -170,6 +194,46 @@ enum RNASeqAnalysisStage: String, Codable, Sendable {
     case failed = "Failed"
 }
 
+enum SearchStage: String, Codable, Sendable {
+    case idle = "Idle"
+    case submitted = "Submitted"
+    case searching = "Searching"
+    case formatting = "Formatting"
+    case finished = "Finished"
+    case failed = "Failed"
+}
+
+struct SearchProgressSnapshot: Equatable, Sendable {
+    var hasActivity = false
+    var isActive = false
+    var stage: SearchStage = .idle
+    var status = "Idle"
+    var program = ""
+    var database = ""
+    var queryLength: Int?
+    var outputPath = ""
+    var outputBytes: Int64 = 0
+    var hitCount = 0
+    var noHits = false
+    var startedAt: Date?
+    var lastUpdated: Date?
+
+    var fractionComplete: Double? {
+        switch stage {
+        case .finished:
+            1
+        default:
+            nil
+        }
+    }
+
+    var elapsed: TimeInterval {
+        guard let startedAt else { return 0 }
+        let endDate = isActive ? Date() : lastUpdated ?? Date()
+        return endDate.timeIntervalSince(startedAt)
+    }
+}
+
 struct RNASeqProgressSnapshot: Equatable, Sendable {
     var hasActivity = false
     var isActive = false
@@ -200,7 +264,8 @@ struct RNASeqProgressSnapshot: Equatable, Sendable {
 
     var elapsed: TimeInterval {
         guard let startedAt else { return 0 }
-        return Date().timeIntervalSince(startedAt)
+        let endDate = isActive ? Date() : lastUpdated ?? Date()
+        return endDate.timeIntervalSince(startedAt)
     }
 }
 
@@ -821,10 +886,15 @@ final class AppModel: ObservableObject {
     @Published var isRunningRNASeq = false
     @Published var isRefreshingCatalog = false
     @Published var isDownloading = false
+    @Published var searchProgress = SearchProgressSnapshot()
+    @Published var blastResultReport: BlastResultReport?
     @Published var downloadProgress = DownloadProgressSnapshot()
     @Published var rnaSeqProgress = RNASeqProgressSnapshot()
     @Published var toolStatuses: [ToolStatus] = []
     @Published var jobs: [BlastJobRecord] = []
+    @Published var selectedJobID: BlastJobRecord.ID?
+    @Published var selectedResultReport: BlastResultReport?
+    @Published var resultLog = ""
     @Published var customDatabaseInput = ""
     @Published var customDatabaseName = ""
     @Published var customDatabaseType = "nucl"
@@ -834,7 +904,10 @@ final class AppModel: ObservableObject {
     private var downloadProgressBaseline = DownloadDirectoryScan()
     private var downloadProgressDirectory = ""
     private var downloadProgressNames: [String] = []
+    private var searchProgressTask: Task<Void, Never>?
     private var rnaSeqProgressTask: Task<Void, Never>?
+    private let automaticResultExtensions: Set<String> = ["txt", "tsv", "out"]
+    private let maxAutoLoadedResultBytes: Int64 = 100 * 1_024 * 1_024
 
     init() {
         let preferences = BlastPreferences.load()
@@ -861,6 +934,7 @@ final class AppModel: ObservableObject {
         ensureWorkingDirectories()
         await refreshTools()
         markInstalledDatabases()
+        refreshResultFiles()
         databaseLog = "Offline startup complete. Local databases were scanned; use Refresh Catalog or Download Selected when you want to contact NCBI."
     }
 
@@ -877,10 +951,7 @@ final class AppModel: ObservableObject {
 
     func ensureDefaultOutputPath() {
         if configuration.outputPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let filename = "blast-\(configuration.program.rawValue)-result.txt"
-            configuration.outputPath = URL(fileURLWithPath: preferences.outputDirectory)
-                .appendingPathComponent(filename)
-                .path
+            configuration.outputPath = defaultBlastOutputPath(for: configuration.program)
         }
     }
 
@@ -890,6 +961,15 @@ final class AppModel: ObservableObject {
                 .appendingPathComponent("rnaseq-annotations.tsv")
                 .path
         }
+    }
+
+    private func defaultBlastOutputPath(for program: BlastProgram, date: Date = Date()) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let filename = "blast-\(program.rawValue)-\(formatter.string(from: date)).txt"
+        return URL(fileURLWithPath: preferences.outputDirectory)
+            .appendingPathComponent(filename)
+            .path
     }
 
     func setProgram(_ program: BlastProgram) {
@@ -1458,13 +1538,13 @@ final class AppModel: ObservableObject {
 
         ensureWorkingDirectories()
         ensureDefaultRNASeqOutputPath()
-        let outputPath = rnaSeqConfiguration.outputPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        let outputURL = URL(fileURLWithPath: outputPath)
-        let outputDirectory = outputURL.deletingLastPathComponent()
+        var outputPath = rnaSeqConfiguration.outputPath.trimmingCharacters(in: .whitespacesAndNewlines)
         let inputFiles = rnaSeqConfiguration.inputFiles
         let keepConvertedFasta = rnaSeqConfiguration.keepConvertedFasta
         let needsGzip = inputFiles.contains(where: RNASeqFastqConverter.isGzipFASTQ)
         let gzipURL = needsGzip ? ProcessClient.resolveExecutable(named: "gzip", preferences: preferences) : nil
+        var activeJobID: BlastJobRecord.ID?
+        let startedAt = Date()
 
         do {
             guard !inputFiles.isEmpty else { throw RNASeqAnalysisError.noInputFiles }
@@ -1476,15 +1556,13 @@ final class AppModel: ObservableObject {
             }
             guard !outputPath.isEmpty else { throw RNASeqAnalysisError.missingOutputPath }
             guard !rnaSeqConfiguration.outputFieldString.isEmpty else { throw RNASeqAnalysisError.noOutputFields }
-            do {
-                try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-            } catch {
-                throw RNASeqAnalysisError.cannotCreateOutputDirectory(outputDirectory.path)
-            }
+            outputPath = try preparedOutputPath(outputPath, program: rnaSeqConfiguration.program)
+            rnaSeqConfiguration.outputPath = outputPath
+            let outputURL = URL(fileURLWithPath: outputPath)
+            let outputDirectory = outputURL.deletingLastPathComponent()
 
             isRunningRNASeq = true
             rnaSeqLog = "Preparing RNA-Seq annotation."
-            let startedAt = Date()
             let totalBytes = totalFileSize(paths: inputFiles)
             rnaSeqProgress = RNASeqProgressSnapshot(
                 hasActivity: true,
@@ -1512,6 +1590,28 @@ final class AppModel: ObservableObject {
 
             let command = try buildRNASeqBlastCommand(queryPath: convertedFastaURL.path)
             rnaSeqCommandPreview = command.preview
+            let jobID = UUID()
+            activeJobID = jobID
+            jobs.insert(
+                BlastJobRecord(
+                    id: jobID,
+                    kind: .rnaSeq,
+                    title: "\(inputFiles.count.formatted()) FASTQ file(s)",
+                    program: rnaSeqConfiguration.program,
+                    database: rnaSeqConfiguration.databaseName,
+                    outputPath: outputPath,
+                    commandPreview: command.preview,
+                    exitCode: nil,
+                    date: startedAt,
+                    status: .running,
+                    duration: nil,
+                    outputBytes: 0,
+                    hitCount: nil,
+                    noHits: false
+                ),
+                at: 0
+            )
+            selectedJobID = jobID
             rnaSeqLog = "Running \(command.preview)"
             startRNASeqOutputMonitor(outputPath: outputPath, convertedReads: convertedReads)
             let result = try await Task.detached {
@@ -1545,18 +1645,26 @@ final class AppModel: ObservableObject {
                 startedAt: startedAt,
                 lastUpdated: Date()
             )
-            jobs.insert(
-                BlastJobRecord(
-                    program: rnaSeqConfiguration.program,
-                    database: rnaSeqConfiguration.databaseName,
-                    outputPath: outputPath,
-                    commandPreview: command.preview,
-                    exitCode: result.exitCode,
-                    date: Date()
-                ),
-                at: 0
-            )
+            let report = readResultReport(at: outputPath)
+            selectedResultReport = report
+            updateJob(jobID) { job in
+                job.exitCode = result.exitCode
+                job.status = result.exitCode == 0 ? .finished : .failed
+                job.duration = Date().timeIntervalSince(startedAt)
+                job.outputBytes = outputBytes
+                job.hitCount = report?.hitCount
+                job.noHits = report?.noHits ?? false
+            }
+            resultLog = "Loaded \(URL(fileURLWithPath: outputPath).lastPathComponent)."
         } catch {
+            if let activeJobID {
+                updateJob(activeJobID) { job in
+                    job.status = .failed
+                    job.duration = Date().timeIntervalSince(startedAt)
+                    job.exitCode = nil
+                    job.outputBytes = outputPath.isEmpty ? job.outputBytes : fileSize(path: outputPath)
+                }
+            }
             stopRNASeqProgressMonitor()
             rnaSeqLog = error.localizedDescription
             var snapshot = rnaSeqProgress
@@ -1639,8 +1747,216 @@ final class AppModel: ObservableObject {
         (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0
     }
 
+    private static func fileModificationDate(path: String) -> Date? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        return attributes?[.modificationDate] as? Date
+    }
+
     private func fileSize(path: String) -> Int64 {
         Self.fileSize(path: path)
+    }
+
+    private func preparedOutputPath(_ requestedPath: String, program: BlastProgram) throws -> String {
+        let trimmed = requestedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let basePath = trimmed.isEmpty ? defaultBlastOutputPath(for: program) : trimmed
+        let resolvedPath = uniqueOutputPath(basePath)
+        try createOutputDirectory(for: resolvedPath)
+        return resolvedPath
+    }
+
+    private func uniqueOutputPath(_ path: String) -> String {
+        guard FileManager.default.fileExists(atPath: path) else { return path }
+
+        let url = URL(fileURLWithPath: path)
+        let directory = url.deletingLastPathComponent()
+        let baseName = url.deletingPathExtension().lastPathComponent
+        let fileExtension = url.pathExtension.isEmpty ? "txt" : url.pathExtension
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let stampedBaseName = "\(baseName)-\(formatter.string(from: Date()))"
+
+        for index in 0..<1_000 {
+            let suffix = index == 0 ? "" : "-\(index + 1)"
+            let candidate = directory
+                .appendingPathComponent("\(stampedBaseName)\(suffix)")
+                .appendingPathExtension(fileExtension)
+                .path
+            if !FileManager.default.fileExists(atPath: candidate) {
+                return candidate
+            }
+        }
+        return directory
+            .appendingPathComponent("\(stampedBaseName)-\(UUID().uuidString)")
+            .appendingPathExtension(fileExtension)
+            .path
+    }
+
+    private func createOutputDirectory(for path: String) throws {
+        let directory = URL(fileURLWithPath: path).deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    func refreshResultFiles() {
+        ensureWorkingDirectories()
+        let directoryURL = URL(fileURLWithPath: preferences.outputDirectory, isDirectory: true)
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            resultLog = "Could not scan \(preferences.outputDirectory)."
+            return
+        }
+
+        var importedCount = 0
+        for url in urls {
+            let resourceValues = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey])
+            guard resourceValues?.isRegularFile == true else { continue }
+            guard automaticResultExtensions.contains(url.pathExtension.lowercased()) else { continue }
+            guard !jobs.contains(where: { $0.outputPath == url.path }) else { continue }
+
+            let outputBytes = Int64(resourceValues?.fileSize ?? 0)
+            let report = outputBytes <= maxAutoLoadedResultBytes ? readResultReport(at: url.path) : nil
+            let program = Self.program(from: report?.program) ?? .blastn
+            jobs.append(
+                BlastJobRecord(
+                    kind: .imported,
+                    title: report?.query.isEmpty == false ? report?.query ?? "" : url.lastPathComponent,
+                    program: program,
+                    database: report?.database ?? "",
+                    outputPath: url.path,
+                    commandPreview: "",
+                    exitCode: nil,
+                    date: resourceValues?.contentModificationDate ?? Date(),
+                    status: .imported,
+                    duration: nil,
+                    outputBytes: outputBytes,
+                    hitCount: report?.hitCount,
+                    noHits: report?.noHits ?? false
+                )
+            )
+            importedCount += 1
+        }
+
+        jobs.sort { lhs, rhs in
+            lhs.date > rhs.date
+        }
+
+        if selectedJobID == nil, let firstJob = jobs.first {
+            selectJob(firstJob)
+        }
+        resultLog = importedCount == 0
+            ? "Result folder is up to date."
+            : "Loaded \(importedCount.formatted()) result file(s) from \(preferences.outputDirectory)."
+    }
+
+    func importResultFile(_ path: String) {
+        let url = URL(fileURLWithPath: path)
+        let outputBytes = fileSize(path: path)
+        let report = outputBytes <= maxAutoLoadedResultBytes ? readResultReport(at: path) : nil
+        let program = Self.program(from: report?.program) ?? .blastn
+        let job = BlastJobRecord(
+            kind: .imported,
+            title: report?.query.isEmpty == false ? report?.query ?? "" : url.lastPathComponent,
+            program: program,
+            database: report?.database ?? "",
+            outputPath: path,
+            commandPreview: "",
+            exitCode: nil,
+            date: Self.fileModificationDate(path: path) ?? Date(),
+            status: .imported,
+            duration: nil,
+            outputBytes: outputBytes,
+            hitCount: report?.hitCount,
+            noHits: report?.noHits ?? false
+        )
+
+        if let existingIndex = jobs.firstIndex(where: { $0.outputPath == path }) {
+            jobs[existingIndex] = job
+        } else {
+            jobs.insert(job, at: 0)
+        }
+        selectJob(job)
+        resultLog = "Loaded \(url.lastPathComponent)."
+    }
+
+    func selectJob(_ job: BlastJobRecord) {
+        selectedJobID = job.id
+        loadResult(for: job)
+    }
+
+    func loadSelectedJobResult() {
+        guard let selectedJobID, let job = jobs.first(where: { $0.id == selectedJobID }) else {
+            selectedResultReport = nil
+            return
+        }
+        loadResult(for: job)
+    }
+
+    func loadResult(for job: BlastJobRecord) {
+        guard FileManager.default.fileExists(atPath: job.outputPath) else {
+            selectedResultReport = nil
+            resultLog = "Result file was not found: \(job.outputPath)"
+            return
+        }
+
+        let outputBytes = fileSize(path: job.outputPath)
+        guard outputBytes <= maxAutoLoadedResultBytes else {
+            selectedResultReport = nil
+            resultLog = "Result file is \(ByteCountFormatter.string(fromByteCount: outputBytes, countStyle: .file)); files over \(ByteCountFormatter.string(fromByteCount: maxAutoLoadedResultBytes, countStyle: .file)) are not loaded into the GUI."
+            return
+        }
+
+        guard let report = readResultReport(at: job.outputPath) else {
+            selectedResultReport = nil
+            resultLog = "Could not read \(URL(fileURLWithPath: job.outputPath).lastPathComponent)."
+            return
+        }
+
+        selectedResultReport = report
+        resultLog = "Loaded \(URL(fileURLWithPath: job.outputPath).lastPathComponent)."
+        if let index = jobs.firstIndex(where: { $0.id == job.id }) {
+            jobs[index].outputBytes = outputBytes
+            jobs[index].hitCount = report.hitCount
+            jobs[index].noHits = report.noHits
+            if jobs[index].database.isEmpty {
+                jobs[index].database = report.database
+            }
+            if jobs[index].title.isEmpty, !report.query.isEmpty {
+                jobs[index].title = report.query
+            }
+        }
+    }
+
+    private func readResultReport(at path: String) -> BlastResultReport? {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return nil
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+        return BlastResultParser.parse(text)
+    }
+
+    private func updateJob(_ id: BlastJobRecord.ID, _ mutation: (inout BlastJobRecord) -> Void) {
+        guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
+        mutation(&jobs[index])
+    }
+
+    private func jobTitle(configuration: BlastSearchConfiguration, queryPath: String) -> String {
+        if !configuration.queryFilePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return URL(fileURLWithPath: queryPath).deletingPathExtension().lastPathComponent
+        }
+        return "\(configuration.program.queryKind.rawValue) Sequence"
+    }
+
+    private static func program(from reportProgram: String?) -> BlastProgram? {
+        guard let reportProgram else { return nil }
+        let normalized = reportProgram.lowercased()
+        return BlastProgram.allCases.first {
+            normalized.contains($0.rawValue) || normalized.contains($0.displayName.lowercased())
+        }
     }
 
     func runSearch() async {
@@ -1651,28 +1967,73 @@ final class AppModel: ObservableObject {
 
         ensureWorkingDirectories()
         ensureDefaultOutputPath()
+        var activeConfiguration = configuration
+        var outputPath = activeConfiguration.outputPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        var activeJobID: BlastJobRecord.ID?
+        let startedAt = Date()
         isRunningSearch = true
-        defer { isRunningSearch = false }
+        blastResultReport = nil
+        defer {
+            stopSearchProgressMonitor()
+            isRunningSearch = false
+        }
 
         do {
             let queryPath = try materializedSequencePath(
-                filePath: configuration.queryFilePath,
-                sequenceText: configuration.queryText,
+                filePath: activeConfiguration.queryFilePath,
+                sequenceText: activeConfiguration.queryText,
                 filenamePrefix: "query",
                 missingError: .missingQuery
             )
-            let subjectPath = configuration.alignTwoSequences ? try materializedSequencePath(
-                filePath: configuration.subjectFilePath,
-                sequenceText: configuration.subjectText,
+            let subjectPath = activeConfiguration.alignTwoSequences ? try materializedSequencePath(
+                filePath: activeConfiguration.subjectFilePath,
+                sequenceText: activeConfiguration.subjectText,
                 filenamePrefix: "subject",
                 missingError: .missingSubject
             ) : ""
+            let queryLength = sequenceResidueCount(filePath: queryPath)
+            outputPath = try preparedOutputPath(outputPath, program: activeConfiguration.program)
+            activeConfiguration.outputPath = outputPath
+            configuration.outputPath = outputPath
             let command = try BlastCommandBuilder.build(
-                configuration: configuration,
+                configuration: activeConfiguration,
                 queryPath: queryPath,
                 subjectPath: subjectPath
             )
-            runLog = "Running \(command.preview)"
+            let jobID = UUID()
+            activeJobID = jobID
+            jobs.insert(
+                BlastJobRecord(
+                    id: jobID,
+                    kind: .blastSearch,
+                    title: jobTitle(configuration: activeConfiguration, queryPath: queryPath),
+                    program: activeConfiguration.program,
+                    database: activeConfiguration.alignTwoSequences ? "pairwise subject" : activeConfiguration.databaseName,
+                    outputPath: outputPath,
+                    commandPreview: command.preview,
+                    exitCode: nil,
+                    date: startedAt,
+                    status: .running,
+                    duration: nil,
+                    outputBytes: 0,
+                    hitCount: nil,
+                    noHits: false
+                ),
+                at: 0
+            )
+            selectedJobID = jobID
+            beginSearchProgress(
+                configuration: activeConfiguration,
+                queryLength: queryLength,
+                outputPath: outputPath
+            )
+            runLog = runningSearchLog(
+                command: command,
+                configuration: activeConfiguration,
+                queryLength: queryLength,
+                outputPath: outputPath
+            )
+            startSearchOutputMonitor(outputPath: outputPath)
             let result = try await Task.detached {
                 try ProcessClient.runSync(
                     executableURL: executable,
@@ -1680,23 +2041,209 @@ final class AppModel: ObservableObject {
                     environment: command.environment
                 )
             }.value
+            stopSearchProgressMonitor()
+
+            var formattingProgress = searchProgress
+            formattingProgress.stage = .formatting
+            formattingProgress.status = "Formatting results"
+            formattingProgress.lastUpdated = Date()
+            searchProgress = formattingProgress
 
             let logText = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-            runLog = logText.isEmpty ? "Finished with exit code \(result.exitCode)." : logText
-            jobs.insert(
-                BlastJobRecord(
-                    program: configuration.program,
-                    database: configuration.databaseName,
-                    outputPath: configuration.outputPath,
-                    commandPreview: command.preview,
-                    exitCode: result.exitCode,
-                    date: Date()
-                ),
-                at: 0
+            let resultText = (try? String(contentsOfFile: outputPath, encoding: .utf8)) ?? ""
+            let report = resultText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? nil
+                : BlastResultParser.parse(resultText)
+            blastResultReport = report
+            selectedResultReport = report
+            finishSearchProgress(exitCode: result.exitCode, report: report, outputPath: outputPath)
+            runLog = completedSearchLog(
+                exitCode: result.exitCode,
+                diagnostics: logText,
+                report: report,
+                outputPath: outputPath
             )
+            updateJob(jobID) { job in
+                job.exitCode = result.exitCode
+                job.status = result.exitCode == 0 ? .finished : .failed
+                job.duration = Date().timeIntervalSince(startedAt)
+                job.outputBytes = fileSize(path: outputPath)
+                job.hitCount = report?.hitCount
+                job.noHits = report?.noHits ?? false
+                if job.database.isEmpty {
+                    job.database = report?.database ?? ""
+                }
+            }
+            selectedJobID = jobID
+            resultLog = "Loaded \(URL(fileURLWithPath: outputPath).lastPathComponent)."
         } catch {
+            if let activeJobID {
+                updateJob(activeJobID) { job in
+                    job.status = .failed
+                    job.duration = Date().timeIntervalSince(startedAt)
+                    job.exitCode = nil
+                    job.outputBytes = outputPath.isEmpty ? job.outputBytes : fileSize(path: outputPath)
+                }
+            }
+            failSearchProgress(error.localizedDescription, outputPath: outputPath)
             runLog = error.localizedDescription
+            resultLog = error.localizedDescription
         }
+    }
+
+    private func beginSearchProgress(
+        configuration: BlastSearchConfiguration,
+        queryLength: Int?,
+        outputPath: String
+    ) {
+        searchProgressTask?.cancel()
+        searchProgress = SearchProgressSnapshot(
+            hasActivity: true,
+            isActive: true,
+            stage: .submitted,
+            status: "Sequence submitted",
+            program: configuration.program.displayName,
+            database: configuration.alignTwoSequences ? "Subject sequence" : configuration.databaseName,
+            queryLength: queryLength,
+            outputPath: outputPath,
+            outputBytes: 0,
+            startedAt: Date(),
+            lastUpdated: Date()
+        )
+    }
+
+    private func startSearchOutputMonitor(outputPath: String) {
+        searchProgressTask?.cancel()
+        let baselineModifiedAt = Self.fileModificationDate(path: outputPath)
+        var snapshot = searchProgress
+        snapshot.stage = .searching
+        snapshot.status = "Searching database"
+        snapshot.outputBytes = 0
+        snapshot.lastUpdated = Date()
+        searchProgress = snapshot
+
+        searchProgressTask = Task { [weak self, outputPath, baselineModifiedAt] in
+            while !Task.isCancelled {
+                let outputBytes = Self.fileSize(path: outputPath)
+                let modifiedAt = Self.fileModificationDate(path: outputPath)
+                let hasCurrentRunOutput: Bool = {
+                    if let baselineModifiedAt {
+                        guard let modifiedAt else { return false }
+                        return modifiedAt > baselineModifiedAt
+                    }
+                    return modifiedAt != nil
+                }()
+                let displayedOutputBytes = hasCurrentRunOutput ? outputBytes : 0
+                await MainActor.run {
+                    guard let self else { return }
+                    var snapshot = self.searchProgress
+                    guard snapshot.isActive else { return }
+                    snapshot.stage = .searching
+                    snapshot.outputBytes = displayedOutputBytes
+                    snapshot.status = displayedOutputBytes > 0 ? "Writing BLAST report" : "Searching database"
+                    snapshot.lastUpdated = Date()
+                    self.searchProgress = snapshot
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func stopSearchProgressMonitor() {
+        searchProgressTask?.cancel()
+        searchProgressTask = nil
+    }
+
+    private func finishSearchProgress(exitCode: Int32, report: BlastResultReport?, outputPath: String) {
+        var snapshot = searchProgress
+        snapshot.hasActivity = true
+        snapshot.isActive = false
+        snapshot.stage = exitCode == 0 ? .finished : .failed
+        snapshot.outputBytes = fileSize(path: outputPath)
+        snapshot.hitCount = report?.hitCount ?? 0
+        snapshot.noHits = report?.noHits ?? false
+        snapshot.status = searchCompletionStatus(exitCode: exitCode, report: report)
+        snapshot.lastUpdated = Date()
+        searchProgress = snapshot
+    }
+
+    private func failSearchProgress(_ message: String, outputPath: String) {
+        var snapshot = searchProgress
+        snapshot.hasActivity = true
+        snapshot.isActive = false
+        snapshot.stage = .failed
+        snapshot.status = message
+        snapshot.outputBytes = outputPath.isEmpty ? snapshot.outputBytes : fileSize(path: outputPath)
+        snapshot.startedAt = snapshot.startedAt ?? Date()
+        snapshot.lastUpdated = Date()
+        searchProgress = snapshot
+    }
+
+    private func searchCompletionStatus(exitCode: Int32, report: BlastResultReport?) -> String {
+        guard exitCode == 0 else {
+            return "BLAST exited with code \(exitCode)"
+        }
+        guard let report else {
+            return "Search finished; no result file content was found"
+        }
+        if report.noHits {
+            return "Search complete: no hits found"
+        }
+        if report.hitCount > 0 {
+            return "Search complete: \(report.hitCount.formatted()) hits"
+        }
+        return "Search complete"
+    }
+
+    private func runningSearchLog(
+        command: BlastCommand,
+        configuration: BlastSearchConfiguration,
+        queryLength: Int?,
+        outputPath: String
+    ) -> String {
+        let queryLengthText = queryLength.map { "\($0.formatted()) letters" } ?? "unknown length"
+        let searchTarget = configuration.alignTwoSequences ? "subject sequence" : configuration.databaseName
+        return """
+        Sequence submitted.
+        Program: \(configuration.program.displayName)
+        Query: \(queryLengthText)
+        Search set: \(searchTarget)
+        Output: \(outputPath)
+
+        Running \(command.preview)
+        """
+    }
+
+    private func completedSearchLog(
+        exitCode: Int32,
+        diagnostics: String,
+        report: BlastResultReport?,
+        outputPath: String
+    ) -> String {
+        var lines = [
+            "Finished with exit code \(exitCode).",
+            "Output: \(outputPath)",
+            "Output size: \(ByteCountFormatter.string(fromByteCount: fileSize(path: outputPath), countStyle: .file))"
+        ]
+
+        if let report {
+            if report.noHits {
+                lines.append("Result: no hits found.")
+            } else if report.hitCount > 0 {
+                lines.append("Result: \(report.hitCount.formatted()) hits parsed.")
+            } else {
+                lines.append("Result: report loaded.")
+            }
+        } else {
+            lines.append("Result: no result file content was found.")
+        }
+
+        if !diagnostics.isEmpty {
+            lines.append("")
+            lines.append("Diagnostics:")
+            lines.append(diagnostics)
+        }
+        return lines.joined(separator: "\n")
     }
 
     func loadHelpForSelectedProgram() async {
@@ -1734,8 +2281,57 @@ final class AppModel: ObservableObject {
             .appendingPathComponent("LocalBlastStudio", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
         let fileURL = tempDirectory.appendingPathComponent("\(filenamePrefix)-\(UUID().uuidString).fasta")
-        try sequence.write(to: fileURL, atomically: true, encoding: .utf8)
+        let defaultIdentifier = filenamePrefix == "query" ? "Query_1" : "Subject_1"
+        try normalizedFASTA(from: sequence, defaultIdentifier: defaultIdentifier)
+            .write(to: fileURL, atomically: true, encoding: .utf8)
         return fileURL.path
+    }
+
+    private func normalizedFASTA(from sequence: String, defaultIdentifier: String) -> String {
+        let trimmed = sequence.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.hasPrefix(">") else {
+            return trimmed.hasSuffix("\n") ? trimmed : "\(trimmed)\n"
+        }
+
+        let residues = trimmed
+            .components(separatedBy: .whitespacesAndNewlines)
+            .joined()
+        return ">\(defaultIdentifier)\n\(wrappedSequence(residues))\n"
+    }
+
+    private func wrappedSequence(_ sequence: String, width: Int = 80) -> String {
+        var lines: [String] = []
+        var current = ""
+        var count = 0
+        for character in sequence {
+            current.append(character)
+            count += 1
+            if count == width {
+                lines.append(current)
+                current = ""
+                count = 0
+            }
+        }
+        if !current.isEmpty {
+            lines.append(current)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func sequenceResidueCount(filePath: String) -> Int? {
+        guard let text = try? String(contentsOfFile: filePath, encoding: .utf8) else {
+            return nil
+        }
+        let count = Self.sequenceResidueCount(in: text)
+        return count > 0 ? count : nil
+    }
+
+    private static func sequenceResidueCount(in text: String) -> Int {
+        text.components(separatedBy: .newlines).reduce(0) { total, line in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.hasPrefix(">") else { return total }
+            return total + trimmed.filter { !$0.isWhitespace }.count
+        }
     }
 }
 
@@ -1755,12 +2351,12 @@ struct RootView: View {
                 RunBlastView()
             case .rnaSeq:
                 RNASeqView()
+            case .results:
+                ResultsView()
             case .databases:
                 DatabasesView()
             case .tools:
                 ToolsView()
-            case .jobs:
-                JobsView()
             }
         }
     }
@@ -1845,7 +2441,11 @@ struct RunBlastView: View {
     private var runSidebar: some View {
         VStack(alignment: .leading, spacing: 12) {
             commandPreview
+            if model.searchProgress.hasActivity {
+                searchProgressPanel
+            }
             outputSection
+            blastResultsSection
             logSection
             helpSection
         }
@@ -1997,6 +2597,240 @@ struct RunBlastView: View {
         }
     }
 
+    private var searchProgressPanel: some View {
+        let progress = model.searchProgress
+        return Panel(title: "Search Progress", systemImage: "waveform.path.ecg") {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(progress.stage.rawValue)
+                        .font(.headline)
+                    Text(progress.status)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if progress.isActive {
+                    Label("Active", systemImage: "bolt.fill")
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                } else if progress.stage == .failed {
+                    Label("Failed", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else {
+                    Label("Complete", systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                }
+            }
+
+            HStack(spacing: 10) {
+                SearchStepIndicator(
+                    label: "Submitted",
+                    systemImage: "paperplane.fill",
+                    isActive: progress.stage == .submitted,
+                    isComplete: searchStageRank(progress.stage) > searchStageRank(.submitted)
+                )
+                SearchStepIndicator(
+                    label: "Search",
+                    systemImage: "magnifyingglass",
+                    isActive: progress.stage == .searching,
+                    isComplete: searchStageRank(progress.stage) > searchStageRank(.searching)
+                )
+                SearchStepIndicator(
+                    label: "Results",
+                    systemImage: "doc.text.magnifyingglass",
+                    isActive: progress.stage == .formatting,
+                    isComplete: progress.stage == .finished
+                )
+            }
+
+            if let fraction = progress.fractionComplete {
+                ProgressView(value: fraction)
+            } else if progress.isActive {
+                ProgressView()
+            } else {
+                ProgressView(value: progress.stage == .finished ? 1 : 0)
+            }
+
+            HStack(spacing: 16) {
+                SummaryMetric(label: "Query", value: queryLengthLabel(progress.queryLength))
+                SummaryMetric(label: "Database", value: progress.database.isEmpty ? "--" : progress.database)
+                SummaryMetric(label: "Output", value: byteLabel(progress.outputBytes))
+                SummaryMetric(label: "Elapsed", value: durationLabel(progress.elapsed))
+            }
+
+            if progress.hitCount > 0 || progress.noHits {
+                Label(progress.noHits ? "No hits found" : "\(progress.hitCount.formatted()) hits parsed", systemImage: "target")
+                    .font(.caption)
+                    .foregroundStyle(progress.noHits ? Color.secondary : Color.green)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var blastResultsSection: some View {
+        if let report = model.blastResultReport, report.hasVisibleResults {
+            BlastResultReportView(
+                report: report,
+                fallbackProgram: model.configuration.program.displayName,
+                fallbackDatabase: model.searchProgress.database
+            )
+        } else if model.searchProgress.hasActivity, !model.isRunningSearch {
+            Panel(title: "BLAST Results", systemImage: "target") {
+                ContentUnavailableView("No BLAST results", systemImage: "doc.text.magnifyingglass")
+                    .frame(minHeight: 120)
+            }
+        }
+    }
+
+    private func resultSummary(_ report: BlastResultReport) -> some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+            GridRow {
+                Text("Program").foregroundStyle(.secondary)
+                Text(report.program.isEmpty ? model.configuration.program.displayName : report.program)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            if !report.query.isEmpty || report.queryLength != nil {
+                GridRow {
+                    Text("Query").foregroundStyle(.secondary)
+                    Text(querySummaryLabel(report))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            GridRow {
+                Text("Database").foregroundStyle(.secondary)
+                Text(report.database.isEmpty ? model.searchProgress.database : report.database)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            if !report.databaseSummary.isEmpty {
+                GridRow {
+                    Text("Size").foregroundStyle(.secondary)
+                    Text(report.databaseSummary)
+                        .lineLimit(2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .font(.callout)
+    }
+
+    private func hitDescriptions(_ hits: [BlastResultHit]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Descriptions")
+                .font(.headline)
+            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
+                GridRow {
+                    Text("Hit").bold()
+                    Text("Score").bold()
+                    Text("E-value").bold()
+                }
+                ForEach(Array(hits.prefix(20).enumerated()), id: \.offset) { _, hit in
+                    GridRow {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(hit.title)
+                                .lineLimit(2)
+                            if !hit.identity.isEmpty || !hit.queryCover.isEmpty {
+                                Text([hit.identity, hit.queryCover].filter { !$0.isEmpty }.joined(separator: "  "))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Text(hit.scoreBits.isEmpty ? "--" : hit.scoreBits)
+                            .font(.system(.caption, design: .monospaced))
+                        Text(hit.eValue.isEmpty ? "--" : hit.eValue)
+                            .font(.system(.caption, design: .monospaced))
+                    }
+                }
+            }
+            if hits.count > 20 {
+                Text("+ \(hits.count - 20) more descriptions in the raw report")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func tabularPreview(_ report: BlastResultReport) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Tabular Hits")
+                .font(.headline)
+            ScrollView(.horizontal) {
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+                    GridRow {
+                        ForEach(Array(report.tabularHeaders.enumerated()), id: \.offset) { _, header in
+                            Text(header)
+                                .bold()
+                                .lineLimit(1)
+                        }
+                    }
+                    ForEach(Array(report.tabularRows.prefix(20).enumerated()), id: \.offset) { _, row in
+                        GridRow {
+                            ForEach(Array(row.enumerated()), id: \.offset) { _, value in
+                                Text(value)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                }
+            }
+            if report.tabularRows.count > 20 {
+                Text("+ \(report.tabularRows.count - 20) more rows in the raw report")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func alignmentPreview(_ alignments: [BlastAlignmentSection]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Alignments")
+                .font(.headline)
+            ForEach(Array(alignments.prefix(8).enumerated()), id: \.offset) { index, alignment in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(alignment.title)
+                        .font(.callout.weight(.semibold))
+                        .lineLimit(2)
+                    HStack(spacing: 10) {
+                        if !alignment.scoreBits.isEmpty {
+                            Label(alignment.scoreBits, systemImage: "sum")
+                        }
+                        if !alignment.eValue.isEmpty {
+                            Label(alignment.eValue, systemImage: "number")
+                        }
+                        if !alignment.identities.isEmpty {
+                            Label(alignment.identities, systemImage: "equal.circle")
+                        }
+                        if !alignment.strand.isEmpty {
+                            Label(alignment.strand, systemImage: "arrow.left.arrow.right")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                    ScrollView([.horizontal, .vertical]) {
+                        Text(alignment.text)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(minHeight: 120, maxHeight: 220)
+                }
+                if index < min(alignments.count, 8) - 1 {
+                    Divider()
+                }
+            }
+            if alignments.count > 8 {
+                Text("+ \(alignments.count - 8) more alignments in the raw report")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var logSection: some View {
         Panel(title: "Run Log", systemImage: "text.bubble") {
             ScrollView {
@@ -2021,6 +2855,51 @@ struct RunBlastView: View {
                 }
                 .frame(minHeight: 180)
             }
+        }
+    }
+
+    private func querySummaryLabel(_ report: BlastResultReport) -> String {
+        let length = report.queryLength.map { " (\($0.formatted()) letters)" } ?? ""
+        return "\(report.query)\(length)"
+    }
+
+    private func queryLengthLabel(_ length: Int?) -> String {
+        length.map { "\($0.formatted()) letters" } ?? "--"
+    }
+
+    private func byteLabel(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    private func durationLabel(_ seconds: TimeInterval) -> String {
+        let totalSeconds = max(Int(seconds.rounded()), 0)
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        }
+        if minutes > 0 {
+            return "\(minutes)m \(seconds)s"
+        }
+        return "\(seconds)s"
+    }
+
+    private func searchStageRank(_ stage: SearchStage) -> Int {
+        switch stage {
+        case .idle:
+            0
+        case .submitted:
+            1
+        case .searching:
+            2
+        case .formatting:
+            3
+        case .finished:
+            4
+        case .failed:
+            4
         }
     }
 }
@@ -2128,6 +3007,42 @@ struct ProgramChoiceButton: View {
                 .stroke(isSelected ? Color.accentColor : Color.secondary.opacity(0.18), lineWidth: 1)
         }
         .help(program.summary)
+    }
+}
+
+struct SearchStepIndicator: View {
+    var label: String
+    var systemImage: String
+    var isActive: Bool
+    var isComplete: Bool
+
+    var body: some View {
+        Label(label, systemImage: iconName)
+            .font(.caption.weight(isActive ? .semibold : .regular))
+            .foregroundStyle(foregroundStyle)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(isActive ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlColor))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var iconName: String {
+        if isComplete {
+            return "checkmark.circle.fill"
+        }
+        return systemImage
+    }
+
+    private var foregroundStyle: Color {
+        if isComplete {
+            return .green
+        }
+        if isActive {
+            return .blue
+        }
+        return .secondary
     }
 }
 
@@ -3124,39 +4039,566 @@ struct ToolsView: View {
     }
 }
 
-struct JobsView: View {
+struct ResultsView: View {
     @EnvironmentObject private var model: AppModel
+
+    private var selectedJob: BlastJobRecord? {
+        guard let selectedJobID = model.selectedJobID else { return nil }
+        return model.jobs.first { $0.id == selectedJobID }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            HeaderBar(title: "Job History", subtitle: "Recent local runs from this session.") { }
-            List(model.jobs) { job in
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text(job.program.displayName)
-                            .font(.headline)
-                        Text(job.database)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Text(job.date, style: .time)
-                        Label("Exit \(job.exitCode)", systemImage: job.exitCode == 0 ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                            .foregroundStyle(job.exitCode == 0 ? .green : .orange)
-                    }
-                    Text(job.outputPath)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                    Text(job.commandPreview)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
+            HeaderBar(
+                title: "Results",
+                subtitle: "Completed jobs and BLAST result files are loaded into a local report viewer."
+            ) {
+                Button {
+                    model.refreshResultFiles()
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
                 }
-                .padding(.vertical, 6)
+
+                Button {
+                    if let path = OpenPanel.chooseFile(allowedExtensions: ["txt", "tsv", "out"]) {
+                        model.importResultFile(path)
+                    }
+                } label: {
+                    Label("Open Result", systemImage: "doc.badge.plus")
+                }
+            }
+
+            GeometryReader { proxy in
+                if proxy.size.width < 1000 {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            jobList
+                                .frame(minHeight: 280)
+                            selectedResult
+                        }
+                        .padding(20)
+                    }
+                } else {
+                    HStack(spacing: 0) {
+                        jobList
+                            .frame(width: min(max(proxy.size.width * 0.32, 320), 440))
+                        Divider()
+                        ScrollView {
+                            selectedResult
+                                .padding(20)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+            }
+        }
+        .onAppear {
+            model.refreshResultFiles()
+            model.loadSelectedJobResult()
+        }
+        .onChange(of: model.selectedJobID) { _, _ in
+            model.loadSelectedJobResult()
+        }
+    }
+
+    private var jobList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Label("Jobs", systemImage: "clock.arrow.circlepath")
+                    .font(.headline)
+                Spacer()
+                Text("\(model.jobs.count.formatted())")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+
+            List(selection: $model.selectedJobID) {
+                ForEach(model.jobs) { job in
+                    ResultJobRow(job: job)
+                        .tag(job.id)
+                }
             }
             .overlay {
                 if model.jobs.isEmpty {
-                    ContentUnavailableView("No BLAST jobs yet", systemImage: "clock", description: Text("Run a search to populate this history."))
+                    ContentUnavailableView(
+                        "No BLAST jobs yet",
+                        systemImage: "doc.text.magnifyingglass",
+                        description: Text("Run a search or open a saved result file.")
+                    )
                 }
             }
+
+            if !model.resultLog.isEmpty {
+                Text(model.resultLog)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .padding(12)
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    @ViewBuilder
+    private var selectedResult: some View {
+        if let selectedJob {
+            VStack(alignment: .leading, spacing: 14) {
+                resultJobHeader(selectedJob)
+                if let report = model.selectedResultReport {
+                    BlastResultReportView(
+                        report: report,
+                        fallbackProgram: selectedJob.program.displayName,
+                        fallbackDatabase: selectedJob.database
+                    )
+                } else if selectedJob.status == .running {
+                    ContentUnavailableView(
+                        "Job is running",
+                        systemImage: "hourglass",
+                        description: Text("The report will load here when BLAST finishes writing the output file.")
+                    )
+                    .frame(minHeight: 260)
+                } else {
+                    ContentUnavailableView(
+                        "No GUI report loaded",
+                        systemImage: "doc.text.magnifyingglass",
+                        description: Text(model.resultLog.isEmpty ? selectedJob.outputPath : model.resultLog)
+                    )
+                    .frame(minHeight: 260)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            ContentUnavailableView(
+                "Select a job",
+                systemImage: "sidebar.left",
+                description: Text("Completed BLAST jobs and imported result files appear in the job list.")
+            )
+            .frame(maxWidth: .infinity, minHeight: 360)
+        }
+    }
+
+    private func resultJobHeader(_ job: BlastJobRecord) -> some View {
+        Panel(title: job.displayTitle, systemImage: "doc.text") {
+            HStack(alignment: .firstTextBaseline, spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("\(job.kind.rawValue) · \(job.program.displayName)")
+                        .font(.callout.weight(.semibold))
+                    Text(job.outputPath)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                Spacer()
+                ResultStatusBadge(job: job)
+            }
+
+            HStack(spacing: 16) {
+                SummaryMetric(label: "Database", value: job.database.isEmpty ? "--" : job.database)
+                SummaryMetric(label: "Hits", value: job.noHits ? "0" : job.hitCount.map { $0.formatted() } ?? "--")
+                SummaryMetric(label: "Output", value: ByteCountFormatter.string(fromByteCount: job.outputBytes, countStyle: .file))
+                SummaryMetric(label: "Runtime", value: durationLabel(job.duration))
+            }
+
+            if !job.commandPreview.isEmpty {
+                DisclosureGroup("Command") {
+                    ScrollView(.horizontal) {
+                        Text(job.commandPreview)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+        }
+    }
+
+    private func durationLabel(_ duration: TimeInterval?) -> String {
+        guard let duration else { return "--" }
+        let totalSeconds = max(Int(duration.rounded()), 0)
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        }
+        if minutes > 0 {
+            return "\(minutes)m \(seconds)s"
+        }
+        return "\(seconds)s"
+    }
+}
+
+struct ResultJobRow: View {
+    var job: BlastJobRecord
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                Image(systemName: statusImage)
+                    .foregroundStyle(statusColor)
+                Text(job.displayTitle)
+                    .font(.headline)
+                    .lineLimit(1)
+                Spacer()
+                Text(job.date, style: .time)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Text(job.program.displayName)
+                    .font(.caption.weight(.semibold))
+                Text(job.database.isEmpty ? job.kind.rawValue : job.database)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            HStack(spacing: 10) {
+                Text(job.status.rawValue)
+                    .foregroundStyle(statusColor)
+                Text(job.noHits ? "No hits" : hitLabel)
+                Text(ByteCountFormatter.string(fromByteCount: job.outputBytes, countStyle: .file))
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Text(URL(fileURLWithPath: job.outputPath).lastPathComponent)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.vertical, 5)
+    }
+
+    private var hitLabel: String {
+        guard let hitCount = job.hitCount else { return "-- hits" }
+        return "\(hitCount.formatted()) hits"
+    }
+
+    private var statusImage: String {
+        switch job.status {
+        case .running:
+            "hourglass"
+        case .finished:
+            "checkmark.circle.fill"
+        case .failed:
+            "exclamationmark.triangle.fill"
+        case .imported:
+            "tray.and.arrow.down.fill"
+        }
+    }
+
+    private var statusColor: Color {
+        switch job.status {
+        case .running:
+            .blue
+        case .finished:
+            .green
+        case .failed:
+            .orange
+        case .imported:
+            .secondary
+        }
+    }
+}
+
+struct ResultStatusBadge: View {
+    var job: BlastJobRecord
+
+    var body: some View {
+        Label(label, systemImage: systemImage)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(color.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var label: String {
+        if let exitCode = job.exitCode {
+            return "\(job.status.rawValue) · Exit \(exitCode)"
+        }
+        return job.status.rawValue
+    }
+
+    private var systemImage: String {
+        switch job.status {
+        case .running:
+            "hourglass"
+        case .finished:
+            "checkmark.circle.fill"
+        case .failed:
+            "exclamationmark.triangle.fill"
+        case .imported:
+            "tray.and.arrow.down.fill"
+        }
+    }
+
+    private var color: Color {
+        switch job.status {
+        case .running:
+            .blue
+        case .finished:
+            .green
+        case .failed:
+            .orange
+        case .imported:
+            .secondary
+        }
+    }
+}
+
+enum BlastResultPane: String, CaseIterable, Identifiable {
+    case descriptions = "Descriptions"
+    case alignments = "Alignments"
+    case table = "Table"
+    case raw = "Raw"
+
+    var id: String { rawValue }
+}
+
+struct BlastResultReportView: View {
+    var report: BlastResultReport
+    var fallbackProgram: String
+    var fallbackDatabase: String
+
+    @State private var selectedPane: BlastResultPane = .descriptions
+
+    var body: some View {
+        Panel(title: "BLAST Report", systemImage: "target") {
+            reportSummary
+
+            Picker("Result view", selection: $selectedPane) {
+                ForEach(BlastResultPane.allCases) { pane in
+                    Text(pane.rawValue).tag(pane)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Group {
+                switch selectedPane {
+                case .descriptions:
+                    descriptionsPane
+                case .alignments:
+                    alignmentsPane
+                case .table:
+                    tablePane
+                case .raw:
+                    rawPane
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var reportSummary: some View {
+        Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 8) {
+            GridRow {
+                summaryLabel("Program")
+                summaryValue(report.program.isEmpty ? fallbackProgram : report.program)
+                summaryLabel("Database")
+                summaryValue(report.database.isEmpty ? fallbackDatabase : report.database)
+            }
+            GridRow {
+                summaryLabel("Query ID")
+                summaryValue(report.query.isEmpty ? "--" : report.query)
+                summaryLabel("Query Length")
+                summaryValue(report.queryLength.map { "\($0.formatted())" } ?? "--")
+            }
+            GridRow {
+                summaryLabel("Hits")
+                summaryValue(report.noHits ? "0" : "\(report.hitCount.formatted())")
+                summaryLabel("Format")
+                summaryValue(report.format.rawValue.capitalized)
+            }
+            if !report.databaseSummary.isEmpty {
+                GridRow {
+                    summaryLabel("Database Size")
+                    Text(report.databaseSummary)
+                        .foregroundStyle(.secondary)
+                        .gridCellColumns(3)
+                        .lineLimit(2)
+                }
+            }
+        }
+        .font(.callout)
+    }
+
+    private func summaryLabel(_ value: String) -> some View {
+        Text(value)
+            .foregroundStyle(.secondary)
+    }
+
+    private func summaryValue(_ value: String) -> some View {
+        Text(value)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private var descriptionsPane: some View {
+        if report.noHits {
+            ContentUnavailableView("No hits found", systemImage: "slash.circle")
+                .frame(minHeight: 180)
+        } else if report.hits.isEmpty {
+            ContentUnavailableView("No description table found", systemImage: "tablecells")
+                .frame(minHeight: 180)
+        } else {
+            ScrollView(.horizontal) {
+                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+                    GridRow {
+                        tableHeader("Description")
+                        tableHeader("Accession")
+                        tableHeader("Score")
+                        tableHeader("E value")
+                        tableHeader("Identity")
+                        tableHeader("Query cover")
+                    }
+                    ForEach(Array(report.hits.prefix(100).enumerated()), id: \.offset) { _, hit in
+                        GridRow {
+                            Text(hit.title)
+                                .frame(minWidth: 320, maxWidth: 520, alignment: .leading)
+                                .lineLimit(2)
+                            monoCell(hit.accession)
+                            monoCell(hit.scoreBits)
+                            monoCell(hit.eValue)
+                            monoCell(hit.identity)
+                            monoCell(hit.queryCover)
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            if report.hits.count > 100 {
+                Text("+ \(report.hits.count - 100) more hits in the raw report")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var alignmentsPane: some View {
+        if report.alignments.isEmpty {
+            ContentUnavailableView("No pairwise alignments found", systemImage: "text.alignleft")
+                .frame(minHeight: 180)
+        } else {
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(Array(report.alignments.prefix(50).enumerated()), id: \.offset) { index, alignment in
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(alignment.title)
+                            .font(.headline)
+                            .lineLimit(2)
+
+                        HStack(spacing: 14) {
+                            metricLabel("Score", alignment.scoreBits)
+                            metricLabel("Expect", alignment.eValue)
+                            metricLabel("Identities", alignment.identities)
+                            metricLabel("Gaps", alignment.gaps)
+                            metricLabel("Strand", alignment.strand)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                        ScrollView([.horizontal, .vertical]) {
+                            Text(alignment.text)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(minHeight: 150, maxHeight: 260)
+                    }
+                    .padding(12)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .overlay(alignment: .top) {
+                        Rectangle()
+                            .fill(Color.accentColor)
+                            .frame(height: 3)
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                    if index < min(report.alignments.count, 50) - 1 {
+                        Divider()
+                    }
+                }
+                if report.alignments.count > 50 {
+                    Text("+ \(report.alignments.count - 50) more alignments in the raw report")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var tablePane: some View {
+        if report.tabularRows.isEmpty {
+            ContentUnavailableView("No tabular rows found", systemImage: "tablecells")
+                .frame(minHeight: 180)
+        } else {
+            ScrollView([.horizontal, .vertical]) {
+                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 7) {
+                    GridRow {
+                        ForEach(Array(report.tabularHeaders.enumerated()), id: \.offset) { _, header in
+                            tableHeader(header)
+                        }
+                    }
+                    ForEach(Array(report.tabularRows.prefix(500).enumerated()), id: \.offset) { _, row in
+                        GridRow {
+                            ForEach(Array(row.enumerated()), id: \.offset) { _, value in
+                                monoCell(value)
+                            }
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .frame(minHeight: 220, maxHeight: 520)
+            if report.tabularRows.count > 500 {
+                Text("+ \(report.tabularRows.count - 500) more rows in the raw report")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var rawPane: some View {
+        ScrollView([.horizontal, .vertical]) {
+            Text(report.rawText)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(minHeight: 300, maxHeight: 620)
+    }
+
+    private func tableHeader(_ value: String) -> some View {
+        Text(value)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+    }
+
+    private func monoCell(_ value: String) -> some View {
+        Text(value.isEmpty ? "--" : value)
+            .font(.system(.caption, design: .monospaced))
+            .lineLimit(1)
+            .textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private func metricLabel(_ label: String, _ value: String) -> some View {
+        if !value.isEmpty {
+            Text("\(label): \(value)")
         }
     }
 }

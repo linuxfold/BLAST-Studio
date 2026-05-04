@@ -275,7 +275,7 @@ public enum BlastParameterCatalog {
             title: "CPU threads",
             group: "General",
             control: .integer,
-            defaultValue: "1",
+            defaultValue: "4",
             help: "Number of local CPU threads to use. Ignored by remote searches."
         ),
         BlastOption(
@@ -913,6 +913,455 @@ public enum BlastCommandBuilder {
             args.append(current)
         }
         return args
+    }
+}
+
+public enum BlastResultFormat: String, Codable, Sendable {
+    case pairwise
+    case tabular
+    case text
+}
+
+public struct BlastResultHit: Identifiable, Codable, Equatable, Sendable {
+    public var title: String
+    public var accession: String
+    public var scoreBits: String
+    public var eValue: String
+    public var identity: String
+    public var queryCover: String
+
+    public var id: String {
+        [accession, title, scoreBits, eValue].joined(separator: "|")
+    }
+
+    public init(
+        title: String,
+        accession: String = "",
+        scoreBits: String = "",
+        eValue: String = "",
+        identity: String = "",
+        queryCover: String = ""
+    ) {
+        self.title = title
+        self.accession = accession
+        self.scoreBits = scoreBits
+        self.eValue = eValue
+        self.identity = identity
+        self.queryCover = queryCover
+    }
+}
+
+public struct BlastAlignmentSection: Identifiable, Codable, Equatable, Sendable {
+    public var title: String
+    public var accession: String
+    public var scoreBits: String
+    public var eValue: String
+    public var identities: String
+    public var gaps: String
+    public var strand: String
+    public var text: String
+
+    public var id: String {
+        [accession, title, scoreBits, eValue].joined(separator: "|")
+    }
+
+    public init(
+        title: String,
+        accession: String = "",
+        scoreBits: String = "",
+        eValue: String = "",
+        identities: String = "",
+        gaps: String = "",
+        strand: String = "",
+        text: String = ""
+    ) {
+        self.title = title
+        self.accession = accession
+        self.scoreBits = scoreBits
+        self.eValue = eValue
+        self.identities = identities
+        self.gaps = gaps
+        self.strand = strand
+        self.text = text
+    }
+}
+
+public struct BlastResultReport: Codable, Equatable, Sendable {
+    public var format: BlastResultFormat
+    public var rawText: String
+    public var program: String
+    public var query: String
+    public var queryLength: Int?
+    public var database: String
+    public var databaseSummary: String
+    public var noHits: Bool
+    public var hits: [BlastResultHit]
+    public var alignments: [BlastAlignmentSection]
+    public var tabularHeaders: [String]
+    public var tabularRows: [[String]]
+
+    public var hitCount: Int {
+        if !hits.isEmpty {
+            return hits.count
+        }
+        if !tabularRows.isEmpty {
+            return tabularRows.count
+        }
+        return alignments.count
+    }
+
+    public var hasVisibleResults: Bool {
+        noHits || hitCount > 0 || !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    public init(
+        format: BlastResultFormat,
+        rawText: String,
+        program: String = "",
+        query: String = "",
+        queryLength: Int? = nil,
+        database: String = "",
+        databaseSummary: String = "",
+        noHits: Bool = false,
+        hits: [BlastResultHit] = [],
+        alignments: [BlastAlignmentSection] = [],
+        tabularHeaders: [String] = [],
+        tabularRows: [[String]] = []
+    ) {
+        self.format = format
+        self.rawText = rawText
+        self.program = program
+        self.query = query
+        self.queryLength = queryLength
+        self.database = database
+        self.databaseSummary = databaseSummary
+        self.noHits = noHits
+        self.hits = hits
+        self.alignments = alignments
+        self.tabularHeaders = tabularHeaders
+        self.tabularRows = tabularRows
+    }
+}
+
+public enum BlastResultParser {
+    public static func parse(_ text: String) -> BlastResultReport {
+        let normalizedText = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let lines = normalizedText.components(separatedBy: .newlines)
+        let tabular = parseTabular(lines)
+        let alignments = parseAlignmentSections(lines)
+        let pairwiseHits = parsePairwiseHits(lines)
+        let hits = pairwiseHits.isEmpty ? tabularHits(rows: tabular.rows, headers: tabular.headers) : pairwiseHits
+        let noHits = normalizedText.range(of: "No hits found", options: .caseInsensitive) != nil
+        let format: BlastResultFormat
+        if !tabular.rows.isEmpty, pairwiseHits.isEmpty, alignments.isEmpty {
+            format = .tabular
+        } else if !pairwiseHits.isEmpty || !alignments.isEmpty || noHits {
+            format = .pairwise
+        } else {
+            format = .text
+        }
+
+        return BlastResultReport(
+            format: format,
+            rawText: normalizedText,
+            program: parseProgram(lines),
+            query: parseQuery(lines),
+            queryLength: parseQueryLength(lines),
+            database: parseDatabase(lines).name,
+            databaseSummary: parseDatabase(lines).summary,
+            noHits: noHits,
+            hits: hits,
+            alignments: alignments,
+            tabularHeaders: tabular.headers,
+            tabularRows: tabular.rows
+        )
+    }
+
+    private static func parseProgram(_ lines: [String]) -> String {
+        lines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { $0.hasPrefix("BLAST") } ?? ""
+    }
+
+    private static func parseQuery(_ lines: [String]) -> String {
+        guard let queryIndex = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("Query=")
+        }) else {
+            return ""
+        }
+
+        let firstLine = lines[queryIndex]
+        var parts = [
+            String(firstLine[firstLine.range(of: "Query=")!.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        ].filter { !$0.isEmpty }
+
+        for line in lines.dropFirst(queryIndex + 1) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                if parts.isEmpty {
+                    continue
+                }
+                break
+            }
+            if trimmed.hasPrefix("Length=") || trimmed.hasPrefix("Database:") {
+                break
+            }
+            parts.append(trimmed)
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private static func parseQueryLength(_ lines: [String]) -> Int? {
+        guard let queryIndex = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("Query=")
+        }) else {
+            return nil
+        }
+        for line in lines.dropFirst(queryIndex + 1) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("Query=")
+                || trimmed.hasPrefix(">")
+                || trimmed.hasPrefix("Sequences producing significant alignments")
+                || trimmed.hasPrefix("Lambda") {
+                break
+            }
+            guard trimmed.hasPrefix("Length=") else { continue }
+            return Int(trimmed.dropFirst("Length=".count).trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+
+    private static func parseDatabase(_ lines: [String]) -> (name: String, summary: String) {
+        guard let index = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("Database:")
+        }) else {
+            return ("", "")
+        }
+
+        let line = lines[index]
+        let name = String(line[line.range(of: "Database:")!.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let summary = lines.dropFirst(index + 1)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty && !$0.hasPrefix(">") } ?? ""
+        return (name, summary)
+    }
+
+    private static func parsePairwiseHits(_ lines: [String]) -> [BlastResultHit] {
+        guard let startIndex = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                .hasPrefix("Sequences producing significant alignments")
+        }) else {
+            return []
+        }
+
+        var hits: [BlastResultHit] = []
+        var hasStartedRows = false
+        for line in lines.dropFirst(startIndex + 1) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                if hasStartedRows {
+                    break
+                }
+                continue
+            }
+            if trimmed.hasPrefix(">") || trimmed.hasPrefix("Database:") {
+                break
+            }
+            let lowercased = trimmed.lowercased()
+            if lowercased.contains("score") || lowercased.contains("bits") || lowercased.contains("e value") {
+                continue
+            }
+            guard let parsed = parseHitTableLine(line) else {
+                if hasStartedRows {
+                    break
+                }
+                continue
+            }
+            hasStartedRows = true
+            hits.append(parsed)
+        }
+        return hits
+    }
+
+    private static func parseHitTableLine(_ line: String) -> BlastResultHit? {
+        let tokens = line.split(whereSeparator: \.isWhitespace)
+        guard tokens.count >= 3 else { return nil }
+        let eValue = String(tokens[tokens.count - 1])
+        let score = String(tokens[tokens.count - 2])
+        guard looksNumeric(score), looksNumeric(eValue) else { return nil }
+
+        var prefix = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let eValueRange = prefix.range(of: eValue, options: .backwards) {
+            prefix.removeSubrange(eValueRange.lowerBound..<prefix.endIndex)
+        }
+        prefix = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let scoreRange = prefix.range(of: score, options: .backwards) {
+            prefix.removeSubrange(scoreRange.lowerBound..<prefix.endIndex)
+        }
+        let title = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return nil }
+        return BlastResultHit(
+            title: title,
+            accession: title.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? "",
+            scoreBits: score,
+            eValue: eValue
+        )
+    }
+
+    private static func parseAlignmentSections(_ lines: [String]) -> [BlastAlignmentSection] {
+        var sections: [BlastAlignmentSection] = []
+        var index = lines.startIndex
+        while index < lines.endIndex {
+            guard lines[index].hasPrefix(">") else {
+                index += 1
+                continue
+            }
+
+            var block = [lines[index]]
+            index += 1
+            while index < lines.endIndex {
+                let line = lines[index]
+                if line.hasPrefix(">") || line.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("Lambda") {
+                    break
+                }
+                block.append(line)
+                index += 1
+            }
+            sections.append(parseAlignmentBlock(block))
+        }
+        return sections
+    }
+
+    private static func parseAlignmentBlock(_ block: [String]) -> BlastAlignmentSection {
+        guard let first = block.first else {
+            return BlastAlignmentSection(title: "")
+        }
+
+        var titleParts = [
+            String(first.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+        ].filter { !$0.isEmpty }
+        for line in block.dropFirst() {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("Length=") || trimmed.hasPrefix("Score =") {
+                break
+            }
+            if !trimmed.isEmpty {
+                titleParts.append(trimmed)
+            }
+        }
+
+        let title = titleParts.joined(separator: " ")
+        let scoreLine = block.first { $0.contains("Score =") } ?? ""
+        let identityLine = block.first { $0.contains("Identities =") } ?? ""
+        let strandLine = block.first { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("Strand=") } ?? ""
+        return BlastAlignmentSection(
+            title: title,
+            accession: title.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? "",
+            scoreBits: extractMetric(from: scoreLine, label: "Score"),
+            eValue: extractMetric(from: scoreLine, label: "Expect"),
+            identities: extractMetric(from: identityLine, label: "Identities"),
+            gaps: extractMetric(from: identityLine, label: "Gaps"),
+            strand: strandLine.replacingOccurrences(of: "Strand=", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            text: block.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    private static func parseTabular(_ lines: [String]) -> (headers: [String], rows: [[String]]) {
+        var fields: [String] = []
+        var rows: [[String]] = []
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("# Fields:") {
+                let fieldText = String(trimmed.dropFirst("# Fields:".count))
+                fields = fieldText
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                continue
+            }
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
+            let columns = line.components(separatedBy: "\t")
+            guard columns.count > 1 else { continue }
+            rows.append(columns)
+        }
+
+        let headers: [String]
+        if let firstRow = rows.first, fields.count == firstRow.count {
+            headers = fields
+        } else if let firstRow = rows.first {
+            headers = (1...firstRow.count).map { "Column \($0)" }
+        } else {
+            headers = []
+        }
+        return (headers, rows)
+    }
+
+    private static func tabularHits(rows: [[String]], headers: [String]) -> [BlastResultHit] {
+        guard !rows.isEmpty else { return [] }
+        let normalizedHeaders = headers.map { normalizeFieldName($0) }
+
+        func value(in row: [String], names: [String], fallbackIndex: Int? = nil) -> String {
+            for name in names {
+                if let index = normalizedHeaders.firstIndex(of: normalizeFieldName(name)), row.indices.contains(index) {
+                    return row[index]
+                }
+            }
+            if let fallbackIndex, row.indices.contains(fallbackIndex) {
+                return row[fallbackIndex]
+            }
+            return ""
+        }
+
+        return rows.prefix(200).map { row in
+            let subject = value(in: row, names: ["sseqid", "subject id", "subject acc.", "subject acc"], fallbackIndex: 1)
+            let title = value(in: row, names: ["stitle", "subject title"], fallbackIndex: 1)
+            let identity = value(in: row, names: ["pident", "% identity"], fallbackIndex: 2)
+            let eValue = value(in: row, names: ["evalue", "e-value"], fallbackIndex: row.count >= 12 ? 10 : nil)
+            let score = value(in: row, names: ["bitscore", "bit score"], fallbackIndex: row.count >= 12 ? 11 : nil)
+            return BlastResultHit(
+                title: title.isEmpty ? subject : title,
+                accession: subject,
+                scoreBits: score,
+                eValue: eValue,
+                identity: identity.isEmpty ? "" : "\(identity)%",
+                queryCover: value(in: row, names: ["qcovhsp", "query cover"])
+            )
+        }
+    }
+
+    private static func extractMetric(from line: String, label: String) -> String {
+        guard let labelRange = line.range(of: label),
+              let equalsRange = line[labelRange.upperBound...].range(of: "=") else {
+            return ""
+        }
+        var value = String(line[equalsRange.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let commaIndex = value.firstIndex(of: ",") {
+            value = String(value[..<commaIndex])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return value
+    }
+
+    private static func normalizeFieldName(_ value: String) -> String {
+        value
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: ".", with: "")
+            .replacingOccurrences(of: "-", with: "")
+    }
+
+    private static func looksNumeric(_ value: String) -> Bool {
+        value.range(
+            of: #"^([0-9]+(\.[0-9]+)?|\.[0-9]+)([eE][+-]?[0-9]+)?$|^[eE][+-]?[0-9]+$"#,
+            options: .regularExpression
+        ) != nil
     }
 }
 
