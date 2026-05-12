@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import LocalBlastCore
 import SwiftUI
@@ -99,6 +100,7 @@ enum BlastJobStatus: String, Hashable {
     case running = "Running"
     case finished = "Finished"
     case failed = "Failed"
+    case killed = "Killed"
     case imported = "Imported"
 }
 
@@ -117,6 +119,8 @@ struct BlastJobRecord: Identifiable, Hashable {
     var outputBytes: Int64 = 0
     var hitCount: Int?
     var noHits = false
+    var linkedGroup: String = ""
+    var reservedThreads: Int = 1
 
     var displayTitle: String {
         title.isEmpty ? URL(fileURLWithPath: outputPath).lastPathComponent : title
@@ -487,16 +491,115 @@ enum LocalBlastError: Error, LocalizedError {
     case toolMissing(String)
     case cannotCreateDirectory(String)
     case emptyDownloadSelection
+    case processFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .toolMissing(let tool):
-            "Could not find \(tool). Set the BLAST+ bin directory in Tools."
+            "Could not find \(tool). Set the BLAST+/IgBLAST bin directory in Tools."
         case .cannotCreateDirectory(let path):
             "Could not create directory: \(path)"
         case .emptyDownloadSelection:
             "Select at least one database to download."
+        case .processFailed(let message):
+            message
         }
+    }
+}
+
+final class TrackedProcessHandle: @unchecked Sendable {
+    private let executableURL: URL
+    private let arguments: [String]
+    private let environment: [String: String]
+    private let currentDirectoryURL: URL?
+    private let lock = NSLock()
+    private var process: Process?
+    private var shouldTerminate = false
+
+    init(
+        executableURL: URL,
+        arguments: [String],
+        environment: [String: String] = [:],
+        currentDirectoryURL: URL? = nil
+    ) {
+        self.executableURL = executableURL
+        self.arguments = arguments
+        self.environment = environment
+        self.currentDirectoryURL = currentDirectoryURL
+    }
+
+    func runAndWait() throws -> ProcessResult {
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        if let currentDirectoryURL {
+            process.currentDirectoryURL = currentDirectoryURL
+        }
+        if !environment.isEmpty {
+            var merged = ProcessInfo.processInfo.environment
+            environment.forEach { merged[$0.key] = $0.value }
+            process.environment = merged
+        }
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        let output = PipeOutputBuffer()
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            output.append(data)
+        }
+
+        lock.lock()
+        self.process = process
+        let terminateImmediately = shouldTerminate
+        lock.unlock()
+
+        try process.run()
+        if terminateImmediately {
+            terminate()
+        }
+        process.waitUntilExit()
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+        let remaining = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        if !remaining.isEmpty {
+            output.append(remaining)
+        }
+
+        lock.lock()
+        self.process = nil
+        lock.unlock()
+
+        return ProcessResult(exitCode: process.terminationStatus, output: output.stringValue())
+    }
+
+    func terminate() {
+        lock.lock()
+        shouldTerminate = true
+        let activeProcess = process
+        lock.unlock()
+
+        guard let activeProcess, activeProcess.isRunning else { return }
+        let pid = activeProcess.processIdentifier
+        Darwin.kill(pid, SIGTERM)
+
+        Task.detached { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            self?.forceKillIfStillRunning(processID: pid)
+        }
+    }
+
+    private func forceKillIfStillRunning(processID: Int32) {
+        lock.lock()
+        let activeProcess = process
+        lock.unlock()
+
+        guard let activeProcess,
+              activeProcess.processIdentifier == processID,
+              activeProcess.isRunning else { return }
+        Darwin.kill(processID, SIGKILL)
     }
 }
 
@@ -860,6 +963,9 @@ final class AppModel: ObservableObject {
         didSet {
             preferences.save()
             configuration.databaseDirectory = preferences.databaseDirectory
+            if configuration.igBlast.additionalDatabaseDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                configuration.igBlast.additionalDatabaseDirectory = preferences.databaseDirectory
+            }
             ensureDefaultOutputPath()
             ensureDefaultRNASeqOutputPath()
             updateCommandPreview()
@@ -884,6 +990,7 @@ final class AppModel: ObservableObject {
     @Published var rnaSeqCommandPreview = ""
     @Published var isRunningSearch = false
     @Published var isRunningRNASeq = false
+    @Published var activeSearchThreadCount = 0
     @Published var isRefreshingCatalog = false
     @Published var isDownloading = false
     @Published var searchProgress = SearchProgressSnapshot()
@@ -899,12 +1006,19 @@ final class AppModel: ObservableObject {
     @Published var customDatabaseName = ""
     @Published var customDatabaseType = "nucl"
     @Published var customDatabaseParseSeqIDs = true
+    @Published var structureInputPath = ""
+    @Published var structureChains: [ProteinChainSequence] = []
+    @Published var structureImportLog = ""
 
     private var downloadProgressTask: Task<Void, Never>?
     private var downloadProgressBaseline = DownloadDirectoryScan()
     private var downloadProgressDirectory = ""
     private var downloadProgressNames: [String] = []
-    private var searchProgressTask: Task<Void, Never>?
+    private var searchProgressTasks: [BlastJobRecord.ID: Task<Void, Never>] = [:]
+    private var activeSearchProgressJobID: BlastJobRecord.ID?
+    private var runningJobHandles: [BlastJobRecord.ID: TrackedProcessHandle] = [:]
+    private var runningJobThreads: [BlastJobRecord.ID: Int] = [:]
+    private var killedJobIDs: Set<BlastJobRecord.ID> = []
     private var rnaSeqProgressTask: Task<Void, Never>?
     private let automaticResultExtensions: Set<String> = ["txt", "tsv", "out"]
     private let maxAutoLoadedResultBytes: Int64 = 100 * 1_024 * 1_024
@@ -912,11 +1026,13 @@ final class AppModel: ObservableObject {
     init() {
         let preferences = BlastPreferences.load()
         self.preferences = preferences
-        self.configuration = BlastSearchConfiguration(
+        var searchConfiguration = BlastSearchConfiguration(
             program: .blastn,
             databaseName: RecommendedBlastDatabases.blastn,
             databaseDirectory: preferences.databaseDirectory
         )
+        searchConfiguration.igBlast = Self.defaultIgBlastConfiguration(preferences: preferences)
+        self.configuration = searchConfiguration
         self.rnaSeqConfiguration = RNASeqAnalysisConfiguration(
             databaseName: "refseq_rna",
             outputPath: URL(fileURLWithPath: preferences.outputDirectory)
@@ -932,10 +1048,10 @@ final class AppModel: ObservableObject {
 
     func bootstrap() async {
         ensureWorkingDirectories()
-        await refreshTools()
+        await refreshTools(checkVersions: false)
         markInstalledDatabases()
         refreshResultFiles()
-        databaseLog = "Offline startup complete. Local databases were scanned; use Refresh Catalog or Download Selected when you want to contact NCBI."
+        databaseLog = "Offline startup complete. Local databases and tool paths were scanned without launching external tools; use Refresh Catalog, Download Selected, or Tools > Recheck when you want to run network or tool checks."
     }
 
     func ensureWorkingDirectories() {
@@ -945,6 +1061,10 @@ final class AppModel: ObservableObject {
         )
         _ = try? FileManager.default.createDirectory(
             at: URL(fileURLWithPath: preferences.outputDirectory),
+            withIntermediateDirectories: true
+        )
+        _ = try? FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: Self.defaultIgBlastDatabaseDirectory(), isDirectory: true),
             withIntermediateDirectories: true
         )
     }
@@ -963,6 +1083,77 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private static func defaultIgBlastConfiguration(preferences: BlastPreferences) -> IgBlastConfiguration {
+        let homeDirectory = FileManager.default.homeDirectoryForCurrentUser.path
+        let igDataDirectory = firstExistingDirectory([
+            "/opt/homebrew/anaconda3/share/igblast",
+            "/opt/homebrew/miniconda3/share/igblast",
+            "/opt/homebrew/miniforge3/share/igblast",
+            "/usr/local/anaconda3/share/igblast",
+            "/usr/local/miniconda3/share/igblast",
+            "\(homeDirectory)/anaconda3/share/igblast",
+            "\(homeDirectory)/miniconda3/share/igblast",
+            "\(homeDirectory)/miniforge3/share/igblast"
+        ])
+        let databaseDirectory = defaultIgBlastDatabaseDirectory()
+        return IgBlastConfiguration(
+            organism: "human",
+            sequenceType: "Ig",
+            igDataDirectory: igDataDirectory,
+            germlineVDatabase: blastDatabasePrefixIfPresent(
+                directory: databaseDirectory,
+                name: "airr_c_human_ig.V"
+            ),
+            germlineDDatabase: blastDatabasePrefixIfPresent(
+                directory: databaseDirectory,
+                name: "airr_c_human_igh.D"
+            ),
+            germlineJDatabase: blastDatabasePrefixIfPresent(
+                directory: databaseDirectory,
+                name: "airr_c_human_ig.J"
+            ),
+            cRegionDatabase: blastDatabasePrefixIfPresent(
+                directory: databaseDirectory,
+                name: "ncbi_human_c_genes"
+            ),
+            auxiliaryDataPath: firstExistingFile([
+                "\(igDataDirectory)/optional_file/human_gl.aux"
+            ]),
+            additionalDatabaseName: "",
+            additionalDatabaseDirectory: preferences.databaseDirectory
+        )
+    }
+
+    private static func defaultIgBlastDatabaseDirectory() -> String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("LocalBlastStudio-IgBlastDatabases", isDirectory: true)
+            .path
+    }
+
+    private static func blastDatabasePrefixIfPresent(directory: String, name: String) -> String {
+        guard !directory.isEmpty else { return "" }
+        let prefix = URL(fileURLWithPath: directory, isDirectory: true).appendingPathComponent(name).path
+        let knownExtensions = ["nhr", "nin", "nsq", "phr", "pin", "psq"]
+        let hasDatabaseFiles = knownExtensions.contains { extensionName in
+            FileManager.default.fileExists(atPath: "\(prefix).\(extensionName)")
+        }
+        return hasDatabaseFiles ? prefix : ""
+    }
+
+    private static func firstExistingDirectory(_ paths: [String]) -> String {
+        paths.first { path in
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+        } ?? ""
+    }
+
+    private static func firstExistingFile(_ paths: [String]) -> String {
+        paths.first { path in
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && !isDirectory.boolValue
+        } ?? ""
+    }
+
     private func defaultBlastOutputPath(for program: BlastProgram, date: Date = Date()) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmmss"
@@ -975,14 +1166,113 @@ final class AppModel: ObservableObject {
     func setProgram(_ program: BlastProgram) {
         configuration.program = program
         configuration.resetOptionsForProgram()
-        if let recommendedDatabaseName = program.recommendedDatabaseName {
+        if program.isIgBlast {
+            configuration.alignTwoSequences = false
+            if configuration.igBlast.additionalDatabaseDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                configuration.igBlast.additionalDatabaseDirectory = preferences.databaseDirectory
+            }
+        } else if let recommendedDatabaseName = program.recommendedDatabaseName {
             configuration.databaseName = recommendedDatabaseName
         } else if let matchingDatabase = databaseCatalog.first(where: { $0.kind == program.databaseKind && $0.isInstalled }) ??
             databaseCatalog.first(where: { $0.kind == program.databaseKind }) {
             configuration.databaseName = matchingDatabase.name
         }
+        refreshStructureQueryTextForSelectedProgram()
         ensureDefaultOutputPath()
         updateCommandPreview()
+    }
+
+    var logicalSearchThreadCount: Int {
+        max(ProcessInfo.processInfo.activeProcessorCount, 1)
+    }
+
+    var availableSearchThreadCount: Int {
+        max(logicalSearchThreadCount - activeSearchThreadCount, 0)
+    }
+
+    var currentSearchThreadRequest: Int {
+        reservedThreadCount(for: configuration)
+    }
+
+    var canStartSearch: Bool {
+        canReserveSearchThreads(currentSearchThreadRequest)
+    }
+
+    var searchCapacityLabel: String {
+        let active = activeSearchThreadCount.formatted()
+        let total = logicalSearchThreadCount.formatted()
+        let request = currentSearchThreadRequest.formatted()
+        if canStartSearch {
+            return "\(active)/\(total) CPU threads active; next search reserves \(request)."
+        }
+        return "\(active)/\(total) CPU threads active; next search needs \(request), so stop a job or lower CPU threads."
+    }
+
+    private func reservedThreadCount(for configuration: BlastSearchConfiguration) -> Int {
+        let rawValue = configuration.optionValues["numThreads"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let requested = Int(rawValue).map { max($0, 1) } ?? 1
+        return min(requested, logicalSearchThreadCount)
+    }
+
+    private func canReserveSearchThreads(_ count: Int) -> Bool {
+        activeSearchThreadCount + max(count, 1) <= logicalSearchThreadCount
+    }
+
+    var supportsStructureQueryImport: Bool {
+        configuration.program == .blastp || configuration.program == .igblastp
+    }
+
+    func importStructureFile(_ path: String) {
+        do {
+            let chains = try ProteinStructureSequenceExtractor.extract(fromFile: path)
+            structureInputPath = path
+            structureChains = chains
+            refreshStructureQueryTextForSelectedProgram()
+            let chainSummary = chains
+                .map { "\($0.chainID) (\($0.sequence.count.formatted()) aa)" }
+                .joined(separator: ", ")
+            structureImportLog = "Loaded \(URL(fileURLWithPath: path).lastPathComponent): \(chainSummary)"
+            updateCommandPreview()
+        } catch {
+            structureImportLog = error.localizedDescription
+        }
+    }
+
+    func clearStructureFile() {
+        structureInputPath = ""
+        structureChains = []
+        structureImportLog = ""
+        if supportsStructureQueryImport {
+            configuration.queryText = ""
+        }
+        updateCommandPreview()
+    }
+
+    private func refreshStructureQueryTextForSelectedProgram() {
+        guard supportsStructureQueryImport, !structureChains.isEmpty else { return }
+        configuration.queryFilePath = ""
+        switch configuration.program {
+        case .igblastp:
+            let selected = igBlastPStructureChains()
+            configuration.queryText = selected
+                .map { chain, label in chain.fastaRecord(label: label) }
+                .joined()
+        case .blastp:
+            configuration.queryText = structureChains
+                .map { $0.fastaRecord() }
+                .joined()
+        default:
+            break
+        }
+    }
+
+    private func igBlastPStructureChains() -> [(chain: ProteinChainSequence, label: String)] {
+        let chainA = structureChains.first { $0.chainID.caseInsensitiveCompare("A") == .orderedSame }
+        let chainB = structureChains.first { $0.chainID.caseInsensitiveCompare("B") == .orderedSame }
+        return [
+            chainA.map { ($0, "LC") },
+            chainB.map { ($0, "HC") }
+        ].compactMap { $0 }
     }
 
     func setRNASeqProgram(_ program: BlastProgram) {
@@ -992,6 +1282,25 @@ final class AppModel: ObservableObject {
     }
 
     func updateCommandPreview() {
+        if supportsStructureQueryImport, !structureChains.isEmpty {
+            switch configuration.program {
+            case .igblastp:
+                let chains = igBlastPStructureChains()
+                if chains.isEmpty {
+                    commandPreview = "Drop a PDB/mmCIF with chain A (LC) and/or chain B (HC) for IgBLASTP."
+                } else {
+                    let chainLabels = chains.map { "\($0.chain.chainID) as \($0.label)" }.joined(separator: ", ")
+                    commandPreview = "Structure batch: IgBLASTP will search \(chainLabels) as linked chain jobs."
+                }
+                return
+            case .blastp:
+                commandPreview = "Structure batch: BLASTP will search \(structureChains.count.formatted()) chain(s) as linked jobs."
+                return
+            default:
+                break
+            }
+        }
+
         let queryPath = configuration.queryFilePath.isEmpty ? "<pasted-query.fasta>" : configuration.queryFilePath
         let subjectPath = configuration.subjectFilePath.isEmpty ? "<subject.fasta>" : configuration.subjectFilePath
         do {
@@ -1082,7 +1391,7 @@ final class AppModel: ObservableObject {
         return try BlastCommandBuilder.build(configuration: blastConfiguration, queryPath: queryPath)
     }
 
-    func refreshTools() async {
+    func refreshTools(checkVersions: Bool = true) async {
         let tools = ProcessClient.searchTools + ProcessClient.utilityTools
         var statuses: [ToolStatus] = []
         for tool in tools {
@@ -1090,11 +1399,16 @@ final class AppModel: ObservableObject {
                 statuses.append(ToolStatus(name: tool, path: "Not found", version: "", isAvailable: false))
                 continue
             }
-            let version = await Task.detached {
-                (try? ProcessClient.runSync(executableURL: url, arguments: ["-version"]).output)
-                    ?? (try? ProcessClient.runSync(executableURL: url, arguments: ["--version"]).output)
-                    ?? ""
-            }.value
+            let version: String
+            if checkVersions {
+                version = await Task.detached {
+                    (try? ProcessClient.runSync(executableURL: url, arguments: ["-version"]).output)
+                        ?? (try? ProcessClient.runSync(executableURL: url, arguments: ["--version"]).output)
+                        ?? ""
+                }.value
+            } else {
+                version = "Version check deferred"
+            }
             statuses.append(
                 ToolStatus(
                     name: tool,
@@ -1544,7 +1858,13 @@ final class AppModel: ObservableObject {
         let needsGzip = inputFiles.contains(where: RNASeqFastqConverter.isGzipFASTQ)
         let gzipURL = needsGzip ? ProcessClient.resolveExecutable(named: "gzip", preferences: preferences) : nil
         var activeJobID: BlastJobRecord.ID?
+        let reservedThreads = min(max(Int(rnaSeqConfiguration.numThreads) ?? 1, 1), logicalSearchThreadCount)
         let startedAt = Date()
+
+        guard canReserveSearchThreads(reservedThreads) else {
+            rnaSeqLog = "Not enough CPU threads available. \(searchCapacityLabel)"
+            return
+        }
 
         do {
             guard !inputFiles.isEmpty else { throw RNASeqAnalysisError.noInputFiles }
@@ -1590,6 +1910,9 @@ final class AppModel: ObservableObject {
 
             let command = try buildRNASeqBlastCommand(queryPath: convertedFastaURL.path)
             rnaSeqCommandPreview = command.preview
+            guard canReserveSearchThreads(reservedThreads) else {
+                throw LocalBlastError.processFailed("Not enough CPU threads available. \(searchCapacityLabel)")
+            }
             let jobID = UUID()
             activeJobID = jobID
             jobs.insert(
@@ -1607,20 +1930,22 @@ final class AppModel: ObservableObject {
                     duration: nil,
                     outputBytes: 0,
                     hitCount: nil,
-                    noHits: false
+                    noHits: false,
+                    linkedGroup: "",
+                    reservedThreads: reservedThreads
                 ),
                 at: 0
             )
             selectedJobID = jobID
             rnaSeqLog = "Running \(command.preview)"
             startRNASeqOutputMonitor(outputPath: outputPath, convertedReads: convertedReads)
-            let result = try await Task.detached {
-                try ProcessClient.runSync(
-                    executableURL: executable,
-                    arguments: command.arguments,
-                    environment: command.environment
-                )
-            }.value
+            let result = try await runTrackedProcess(
+                jobID: jobID,
+                reservedThreads: reservedThreads,
+                executableURL: executable,
+                arguments: command.arguments,
+                environment: command.environment
+            )
             stopRNASeqProgressMonitor()
 
             if !keepConvertedFasta {
@@ -1629,14 +1954,15 @@ final class AppModel: ObservableObject {
 
             let outputBytes = fileSize(path: outputPath)
             let logText = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-            rnaSeqLog = logText.isEmpty
-                ? "RNA-Seq annotation finished with exit code \(result.exitCode)."
-                : logText
+            let wasKilled = killedJobIDs.contains(jobID)
+            rnaSeqLog = wasKilled
+                ? "RNA-Seq annotation killed."
+                : (logText.isEmpty ? "RNA-Seq annotation finished with exit code \(result.exitCode)." : logText)
             rnaSeqProgress = RNASeqProgressSnapshot(
                 hasActivity: true,
                 isActive: false,
-                stage: result.exitCode == 0 ? .finished : .failed,
-                status: result.exitCode == 0 ? "Annotation finished" : "BLAST exited with code \(result.exitCode)",
+                stage: wasKilled ? .failed : (result.exitCode == 0 ? .finished : .failed),
+                status: wasKilled ? "Job killed" : (result.exitCode == 0 ? "Annotation finished" : "BLAST exited with code \(result.exitCode)"),
                 inputFileCount: inputFiles.count,
                 totalInputBytes: totalBytes,
                 processedInputBytes: totalBytes,
@@ -1646,32 +1972,38 @@ final class AppModel: ObservableObject {
                 lastUpdated: Date()
             )
             let report = readResultReport(at: outputPath)
-            selectedResultReport = report
+            if !wasKilled {
+                selectedResultReport = report
+            }
             updateJob(jobID) { job in
                 job.exitCode = result.exitCode
-                job.status = result.exitCode == 0 ? .finished : .failed
+                job.status = wasKilled ? .killed : (result.exitCode == 0 ? .finished : .failed)
                 job.duration = Date().timeIntervalSince(startedAt)
                 job.outputBytes = outputBytes
                 job.hitCount = report?.hitCount
                 job.noHits = report?.noHits ?? false
             }
-            resultLog = "Loaded \(URL(fileURLWithPath: outputPath).lastPathComponent)."
+            killedJobIDs.remove(jobID)
+            resultLog = wasKilled ? "Killed \(URL(fileURLWithPath: outputPath).lastPathComponent)." : "Loaded \(URL(fileURLWithPath: outputPath).lastPathComponent)."
         } catch {
+            var wasKilled = false
             if let activeJobID {
+                wasKilled = killedJobIDs.remove(activeJobID) != nil
                 updateJob(activeJobID) { job in
-                    job.status = .failed
+                    job.status = wasKilled ? .killed : .failed
                     job.duration = Date().timeIntervalSince(startedAt)
                     job.exitCode = nil
                     job.outputBytes = outputPath.isEmpty ? job.outputBytes : fileSize(path: outputPath)
                 }
             }
             stopRNASeqProgressMonitor()
-            rnaSeqLog = error.localizedDescription
+            let message = wasKilled ? "Job killed." : error.localizedDescription
+            rnaSeqLog = message
             var snapshot = rnaSeqProgress
             snapshot.hasActivity = true
             snapshot.isActive = false
             snapshot.stage = .failed
-            snapshot.status = error.localizedDescription
+            snapshot.status = message
             snapshot.lastUpdated = Date()
             rnaSeqProgress = snapshot
         }
@@ -1765,8 +2097,13 @@ final class AppModel: ObservableObject {
     }
 
     private func uniqueOutputPath(_ path: String) -> String {
-        guard FileManager.default.fileExists(atPath: path) else { return path }
+        guard outputPathIsAvailable(path) else {
+            return uniqueStampedOutputPath(path)
+        }
+        return path
+    }
 
+    private func uniqueStampedOutputPath(_ path: String) -> String {
         let url = URL(fileURLWithPath: path)
         let directory = url.deletingLastPathComponent()
         let baseName = url.deletingPathExtension().lastPathComponent
@@ -1781,7 +2118,7 @@ final class AppModel: ObservableObject {
                 .appendingPathComponent("\(stampedBaseName)\(suffix)")
                 .appendingPathExtension(fileExtension)
                 .path
-            if !FileManager.default.fileExists(atPath: candidate) {
+            if outputPathIsAvailable(candidate) {
                 return candidate
             }
         }
@@ -1789,6 +2126,11 @@ final class AppModel: ObservableObject {
             .appendingPathComponent("\(stampedBaseName)-\(UUID().uuidString)")
             .appendingPathExtension(fileExtension)
             .path
+    }
+
+    private func outputPathIsAvailable(_ path: String) -> Bool {
+        !FileManager.default.fileExists(atPath: path) &&
+        !jobs.contains { runningJobHandles[$0.id] != nil && $0.outputPath == path }
     }
 
     private func createOutputDirectory(for path: String) throws {
@@ -1944,11 +2286,75 @@ final class AppModel: ObservableObject {
         mutation(&jobs[index])
     }
 
+    func killJob(_ id: BlastJobRecord.ID) {
+        guard let handle = runningJobHandles[id] else { return }
+        killedJobIDs.insert(id)
+        handle.terminate()
+        updateJob(id) { job in
+            job.status = .killed
+            job.duration = Date().timeIntervalSince(job.date)
+            job.outputBytes = fileSize(path: job.outputPath)
+        }
+        if activeSearchProgressJobID == id {
+            failSearchProgress("Stopping job...", outputPath: jobs.first { $0.id == id }?.outputPath ?? "", jobID: id)
+        }
+        resultLog = "Stopping job."
+    }
+
+    func killAllRunningJobs() {
+        let ids = Array(runningJobHandles.keys)
+        guard !ids.isEmpty else { return }
+        ids.forEach { killJob($0) }
+        runLog = "Stopping \(ids.count.formatted()) running job(s)."
+    }
+
+    func isJobRunning(_ id: BlastJobRecord.ID) -> Bool {
+        runningJobHandles[id] != nil
+    }
+
+    private func runTrackedProcess(
+        jobID: BlastJobRecord.ID,
+        reservedThreads: Int,
+        executableURL: URL,
+        arguments: [String],
+        environment: [String: String] = [:]
+    ) async throws -> ProcessResult {
+        let handle = TrackedProcessHandle(
+            executableURL: executableURL,
+            arguments: arguments,
+            environment: environment
+        )
+        runningJobHandles[jobID] = handle
+        runningJobThreads[jobID] = reservedThreads
+        refreshRunningSearchState()
+        defer {
+            runningJobHandles.removeValue(forKey: jobID)
+            runningJobThreads.removeValue(forKey: jobID)
+            refreshRunningSearchState()
+        }
+
+        return try await Task.detached {
+            try handle.runAndWait()
+        }.value
+    }
+
+    private func refreshRunningSearchState() {
+        activeSearchThreadCount = runningJobThreads.values.reduce(0, +)
+        isRunningSearch = !runningJobHandles.isEmpty
+    }
+
     private func jobTitle(configuration: BlastSearchConfiguration, queryPath: String) -> String {
         if !configuration.queryFilePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return URL(fileURLWithPath: queryPath).deletingPathExtension().lastPathComponent
         }
         return "\(configuration.program.queryKind.rawValue) Sequence"
+    }
+
+    private func searchTargetDescription(for configuration: BlastSearchConfiguration) -> String {
+        if configuration.program.isIgBlast {
+            return configuration.igBlast.searchTargetDescription(for: configuration.program)
+        }
+        return configuration.alignTwoSequences ? "Subject sequence" : configuration.databaseName
     }
 
     private static func program(from reportProgram: String?) -> BlastProgram? {
@@ -1965,17 +2371,23 @@ final class AppModel: ObservableObject {
             return
         }
 
+        if supportsStructureQueryImport, !structureChains.isEmpty {
+            await runStructureSearch(executable: executable)
+            return
+        }
+
         ensureWorkingDirectories()
         ensureDefaultOutputPath()
         var activeConfiguration = configuration
         var outputPath = activeConfiguration.outputPath.trimmingCharacters(in: .whitespacesAndNewlines)
         var activeJobID: BlastJobRecord.ID?
+        let reservedThreads = reservedThreadCount(for: activeConfiguration)
         let startedAt = Date()
-        isRunningSearch = true
         blastResultReport = nil
-        defer {
-            stopSearchProgressMonitor()
-            isRunningSearch = false
+
+        guard canReserveSearchThreads(reservedThreads) else {
+            runLog = "Not enough CPU threads available. \(searchCapacityLabel)"
+            return
         }
 
         do {
@@ -2008,7 +2420,7 @@ final class AppModel: ObservableObject {
                     kind: .blastSearch,
                     title: jobTitle(configuration: activeConfiguration, queryPath: queryPath),
                     program: activeConfiguration.program,
-                    database: activeConfiguration.alignTwoSequences ? "pairwise subject" : activeConfiguration.databaseName,
+                    database: searchTargetDescription(for: activeConfiguration),
                     outputPath: outputPath,
                     commandPreview: command.preview,
                     exitCode: nil,
@@ -2017,12 +2429,15 @@ final class AppModel: ObservableObject {
                     duration: nil,
                     outputBytes: 0,
                     hitCount: nil,
-                    noHits: false
+                    noHits: false,
+                    linkedGroup: "",
+                    reservedThreads: reservedThreads
                 ),
                 at: 0
             )
             selectedJobID = jobID
             beginSearchProgress(
+                jobID: jobID,
                 configuration: activeConfiguration,
                 queryLength: queryLength,
                 outputPath: outputPath
@@ -2033,39 +2448,47 @@ final class AppModel: ObservableObject {
                 queryLength: queryLength,
                 outputPath: outputPath
             )
-            startSearchOutputMonitor(outputPath: outputPath)
-            let result = try await Task.detached {
-                try ProcessClient.runSync(
-                    executableURL: executable,
-                    arguments: command.arguments,
-                    environment: command.environment
-                )
-            }.value
-            stopSearchProgressMonitor()
+            startSearchOutputMonitor(jobID: jobID, outputPath: outputPath)
+            let result = try await runTrackedProcess(
+                jobID: jobID,
+                reservedThreads: reservedThreads,
+                executableURL: executable,
+                arguments: command.arguments,
+                environment: command.environment
+            )
+            stopSearchProgressMonitor(jobID: jobID)
 
-            var formattingProgress = searchProgress
-            formattingProgress.stage = .formatting
-            formattingProgress.status = "Formatting results"
-            formattingProgress.lastUpdated = Date()
-            searchProgress = formattingProgress
+            if activeSearchProgressJobID == jobID {
+                var formattingProgress = searchProgress
+                formattingProgress.stage = .formatting
+                formattingProgress.status = "Formatting results"
+                formattingProgress.lastUpdated = Date()
+                searchProgress = formattingProgress
+            }
 
             let logText = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
             let resultText = (try? String(contentsOfFile: outputPath, encoding: .utf8)) ?? ""
             let report = resultText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? nil
                 : BlastResultParser.parse(resultText)
-            blastResultReport = report
-            selectedResultReport = report
-            finishSearchProgress(exitCode: result.exitCode, report: report, outputPath: outputPath)
-            runLog = completedSearchLog(
-                exitCode: result.exitCode,
-                diagnostics: logText,
-                report: report,
-                outputPath: outputPath
-            )
+            let wasKilled = killedJobIDs.contains(jobID)
+            if !wasKilled {
+                blastResultReport = report
+                selectedResultReport = report
+            }
+            finishSearchProgress(exitCode: result.exitCode, report: report, outputPath: outputPath, jobID: jobID)
+            killedJobIDs.remove(jobID)
+            runLog = wasKilled
+                ? "Killed job: \(outputPath)"
+                : completedSearchLog(
+                    exitCode: result.exitCode,
+                    diagnostics: logText,
+                    report: report,
+                    outputPath: outputPath
+                )
             updateJob(jobID) { job in
                 job.exitCode = result.exitCode
-                job.status = result.exitCode == 0 ? .finished : .failed
+                job.status = wasKilled ? .killed : (result.exitCode == 0 ? .finished : .failed)
                 job.duration = Date().timeIntervalSince(startedAt)
                 job.outputBytes = fileSize(path: outputPath)
                 job.hitCount = report?.hitCount
@@ -2075,35 +2498,224 @@ final class AppModel: ObservableObject {
                 }
             }
             selectedJobID = jobID
-            resultLog = "Loaded \(URL(fileURLWithPath: outputPath).lastPathComponent)."
+            resultLog = wasKilled ? "Killed \(URL(fileURLWithPath: outputPath).lastPathComponent)." : "Loaded \(URL(fileURLWithPath: outputPath).lastPathComponent)."
         } catch {
+            var wasKilled = false
             if let activeJobID {
+                stopSearchProgressMonitor(jobID: activeJobID)
+                wasKilled = killedJobIDs.remove(activeJobID) != nil
                 updateJob(activeJobID) { job in
-                    job.status = .failed
+                    job.status = wasKilled ? .killed : .failed
                     job.duration = Date().timeIntervalSince(startedAt)
                     job.exitCode = nil
                     job.outputBytes = outputPath.isEmpty ? job.outputBytes : fileSize(path: outputPath)
                 }
+                failSearchProgress(wasKilled ? "Job killed" : error.localizedDescription, outputPath: outputPath, jobID: activeJobID)
+            } else {
+                failSearchProgress(error.localizedDescription, outputPath: outputPath)
             }
-            failSearchProgress(error.localizedDescription, outputPath: outputPath)
-            runLog = error.localizedDescription
-            resultLog = error.localizedDescription
+            let message = wasKilled ? "Job killed." : error.localizedDescription
+            runLog = message
+            resultLog = message
         }
     }
 
+    private func runStructureSearch(executable: URL) async {
+        ensureWorkingDirectories()
+        ensureDefaultOutputPath()
+
+        let selectedChains: [(chain: ProteinChainSequence, label: String)]
+        switch configuration.program {
+        case .igblastp:
+            selectedChains = igBlastPStructureChains()
+        case .blastp:
+            selectedChains = structureChains.map { ($0, "Chain \($0.chainID)") }
+        default:
+            selectedChains = []
+        }
+
+        guard !selectedChains.isEmpty else {
+            runLog = configuration.program == .igblastp
+                ? "IgBLASTP structure import expects chain A (LC) and/or chain B (HC)."
+                : "No protein chains are loaded from the structure file."
+            return
+        }
+
+        let activeConfigurationTemplate = configuration
+        let groupTitle = linkedStructureGroupTitle(program: activeConfigurationTemplate.program)
+        let startedAt = Date()
+        var completedLogs: [String] = []
+        var firstCompletedReport: BlastResultReport?
+        var firstCompletedJobID: BlastJobRecord.ID?
+
+        blastResultReport = nil
+
+        for (index, item) in selectedChains.enumerated() {
+            var activeConfiguration = activeConfigurationTemplate
+            activeConfiguration.queryText = ""
+            activeConfiguration.queryFilePath = ""
+            activeConfiguration.alignTwoSequences = false
+            let chainStartedAt = Date()
+            var outputPath = ""
+            var activeJobID: BlastJobRecord.ID?
+            let reservedThreads = reservedThreadCount(for: activeConfiguration)
+
+            guard canReserveSearchThreads(reservedThreads) else {
+                completedLogs.append("Chain \(item.chain.chainID) (\(item.label)) did not start: \(searchCapacityLabel)")
+                break
+            }
+
+            do {
+                let queryPath = try materializedStructureChainPath(chain: item.chain, label: item.label)
+                outputPath = try preparedOutputPath(
+                    structureOutputPath(
+                        basePath: activeConfigurationTemplate.outputPath,
+                        chain: item.chain,
+                        label: item.label,
+                        index: index
+                    ),
+                    program: activeConfiguration.program
+                )
+                activeConfiguration.outputPath = outputPath
+                let queryLength = item.chain.sequence.count
+                let command = try BlastCommandBuilder.build(
+                    configuration: activeConfiguration,
+                    queryPath: queryPath
+                )
+
+                let jobID = UUID()
+                activeJobID = jobID
+                jobs.insert(
+                    BlastJobRecord(
+                        id: jobID,
+                        kind: .blastSearch,
+                        title: structureJobTitle(chain: item.chain, label: item.label),
+                        program: activeConfiguration.program,
+                        database: searchTargetDescription(for: activeConfiguration),
+                        outputPath: outputPath,
+                        commandPreview: command.preview,
+                        exitCode: nil,
+                        date: chainStartedAt,
+                        status: .running,
+                        duration: nil,
+                        outputBytes: 0,
+                        hitCount: nil,
+                        noHits: false,
+                        linkedGroup: groupTitle,
+                        reservedThreads: reservedThreads
+                    ),
+                    at: 0
+                )
+                selectedJobID = jobID
+                beginSearchProgress(
+                    jobID: jobID,
+                    configuration: activeConfiguration,
+                    queryLength: queryLength,
+                    outputPath: outputPath
+                )
+                runLog = """
+                \(groupTitle)
+                Chain \(item.chain.chainID) (\(item.label)): \(queryLength.formatted()) residues
+
+                Running \(command.preview)
+                """
+                startSearchOutputMonitor(jobID: jobID, outputPath: outputPath)
+                let result = try await runTrackedProcess(
+                    jobID: jobID,
+                    reservedThreads: reservedThreads,
+                    executableURL: executable,
+                    arguments: command.arguments,
+                    environment: command.environment
+                )
+                stopSearchProgressMonitor(jobID: jobID)
+
+                if activeSearchProgressJobID == jobID {
+                    var formattingProgress = searchProgress
+                    formattingProgress.stage = .formatting
+                    formattingProgress.status = "Formatting \(item.label)"
+                    formattingProgress.lastUpdated = Date()
+                    searchProgress = formattingProgress
+                }
+
+                let logText = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                let resultText = (try? String(contentsOfFile: outputPath, encoding: .utf8)) ?? ""
+                let report = resultText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? nil
+                    : BlastResultParser.parse(resultText)
+                let wasKilled = killedJobIDs.contains(jobID)
+                if !wasKilled, firstCompletedReport == nil {
+                    firstCompletedReport = report
+                    firstCompletedJobID = jobID
+                }
+                finishSearchProgress(exitCode: result.exitCode, report: report, outputPath: outputPath, jobID: jobID)
+                killedJobIDs.remove(jobID)
+                completedLogs.append(
+                    wasKilled ? "Chain \(item.chain.chainID) (\(item.label)) killed." : completedSearchLog(
+                        exitCode: result.exitCode,
+                        diagnostics: logText,
+                        report: report,
+                        outputPath: outputPath
+                    )
+                )
+                updateJob(jobID) { job in
+                    job.exitCode = result.exitCode
+                    job.status = wasKilled ? .killed : (result.exitCode == 0 ? .finished : .failed)
+                    job.duration = Date().timeIntervalSince(chainStartedAt)
+                    job.outputBytes = fileSize(path: outputPath)
+                    job.hitCount = report?.hitCount
+                    job.noHits = report?.noHits ?? false
+                    if job.database.isEmpty {
+                        job.database = report?.database ?? ""
+                    }
+                }
+            } catch {
+                if let activeJobID {
+                    stopSearchProgressMonitor(jobID: activeJobID)
+                    let wasKilled = killedJobIDs.remove(activeJobID) != nil
+                    updateJob(activeJobID) { job in
+                        job.status = wasKilled ? .killed : .failed
+                        job.duration = Date().timeIntervalSince(chainStartedAt)
+                        job.exitCode = nil
+                        job.outputBytes = outputPath.isEmpty ? job.outputBytes : fileSize(path: outputPath)
+                    }
+                    failSearchProgress(wasKilled ? "Job killed" : error.localizedDescription, outputPath: outputPath, jobID: activeJobID)
+                    completedLogs.append(wasKilled ? "Chain \(item.chain.chainID) (\(item.label)) killed." : "Chain \(item.chain.chainID) (\(item.label)) failed: \(error.localizedDescription)")
+                } else {
+                    failSearchProgress(error.localizedDescription, outputPath: outputPath)
+                    completedLogs.append("Chain \(item.chain.chainID) (\(item.label)) failed: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        blastResultReport = firstCompletedReport
+        selectedResultReport = firstCompletedReport
+        if let firstCompletedJobID {
+            selectedJobID = firstCompletedJobID
+        }
+        let elapsed = Date().timeIntervalSince(startedAt)
+        runLog = """
+        \(groupTitle)
+        Finished \(selectedChains.count.formatted()) linked chain job(s) in \(durationLabel(elapsed)).
+
+        \(completedLogs.joined(separator: "\n\n"))
+        """
+        resultLog = "Loaded linked structure search: \(groupTitle)."
+    }
+
     private func beginSearchProgress(
+        jobID: BlastJobRecord.ID,
         configuration: BlastSearchConfiguration,
         queryLength: Int?,
         outputPath: String
     ) {
-        searchProgressTask?.cancel()
+        activeSearchProgressJobID = jobID
         searchProgress = SearchProgressSnapshot(
             hasActivity: true,
             isActive: true,
             stage: .submitted,
             status: "Sequence submitted",
             program: configuration.program.displayName,
-            database: configuration.alignTwoSequences ? "Subject sequence" : configuration.databaseName,
+            database: searchTargetDescription(for: configuration),
             queryLength: queryLength,
             outputPath: outputPath,
             outputBytes: 0,
@@ -2112,8 +2724,8 @@ final class AppModel: ObservableObject {
         )
     }
 
-    private func startSearchOutputMonitor(outputPath: String) {
-        searchProgressTask?.cancel()
+    private func startSearchOutputMonitor(jobID: BlastJobRecord.ID, outputPath: String) {
+        searchProgressTasks[jobID]?.cancel()
         let baselineModifiedAt = Self.fileModificationDate(path: outputPath)
         var snapshot = searchProgress
         snapshot.stage = .searching
@@ -2122,7 +2734,7 @@ final class AppModel: ObservableObject {
         snapshot.lastUpdated = Date()
         searchProgress = snapshot
 
-        searchProgressTask = Task { [weak self, outputPath, baselineModifiedAt] in
+        searchProgressTasks[jobID] = Task { [weak self, jobID, outputPath, baselineModifiedAt] in
             while !Task.isCancelled {
                 let outputBytes = Self.fileSize(path: outputPath)
                 let modifiedAt = Self.fileModificationDate(path: outputPath)
@@ -2136,6 +2748,10 @@ final class AppModel: ObservableObject {
                 let displayedOutputBytes = hasCurrentRunOutput ? outputBytes : 0
                 await MainActor.run {
                     guard let self else { return }
+                    self.updateJob(jobID) { job in
+                        job.outputBytes = displayedOutputBytes
+                    }
+                    guard self.activeSearchProgressJobID == jobID else { return }
                     var snapshot = self.searchProgress
                     guard snapshot.isActive else { return }
                     snapshot.stage = .searching
@@ -2149,25 +2765,41 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func stopSearchProgressMonitor() {
-        searchProgressTask?.cancel()
-        searchProgressTask = nil
+    private func stopSearchProgressMonitor(jobID: BlastJobRecord.ID) {
+        searchProgressTasks[jobID]?.cancel()
+        searchProgressTasks[jobID] = nil
     }
 
-    private func finishSearchProgress(exitCode: Int32, report: BlastResultReport?, outputPath: String) {
+    private func stopSearchProgressMonitor() {
+        for task in searchProgressTasks.values {
+            task.cancel()
+        }
+        searchProgressTasks.removeAll()
+    }
+
+    private func finishSearchProgress(
+        exitCode: Int32,
+        report: BlastResultReport?,
+        outputPath: String,
+        jobID: BlastJobRecord.ID
+    ) {
+        guard activeSearchProgressJobID == jobID else { return }
         var snapshot = searchProgress
         snapshot.hasActivity = true
         snapshot.isActive = false
-        snapshot.stage = exitCode == 0 ? .finished : .failed
+        snapshot.stage = killedJobIDs.contains(jobID) ? .failed : (exitCode == 0 ? .finished : .failed)
         snapshot.outputBytes = fileSize(path: outputPath)
         snapshot.hitCount = report?.hitCount ?? 0
         snapshot.noHits = report?.noHits ?? false
-        snapshot.status = searchCompletionStatus(exitCode: exitCode, report: report)
+        snapshot.status = killedJobIDs.contains(jobID) ? "Job killed" : searchCompletionStatus(exitCode: exitCode, report: report)
         snapshot.lastUpdated = Date()
         searchProgress = snapshot
     }
 
-    private func failSearchProgress(_ message: String, outputPath: String) {
+    private func failSearchProgress(_ message: String, outputPath: String, jobID: BlastJobRecord.ID? = nil) {
+        if let jobID, activeSearchProgressJobID != jobID {
+            return
+        }
         var snapshot = searchProgress
         snapshot.hasActivity = true
         snapshot.isActive = false
@@ -2202,7 +2834,7 @@ final class AppModel: ObservableObject {
         outputPath: String
     ) -> String {
         let queryLengthText = queryLength.map { "\($0.formatted()) letters" } ?? "unknown length"
-        let searchTarget = configuration.alignTwoSequences ? "subject sequence" : configuration.databaseName
+        let searchTarget = searchTargetDescription(for: configuration)
         return """
         Sequence submitted.
         Program: \(configuration.program.displayName)
@@ -2244,6 +2876,64 @@ final class AppModel: ObservableObject {
             lines.append(diagnostics)
         }
         return lines.joined(separator: "\n")
+    }
+
+    private func linkedStructureGroupTitle(program: BlastProgram) -> String {
+        let fileName = structureInputPath.isEmpty
+            ? "Structure"
+            : URL(fileURLWithPath: structureInputPath).deletingPathExtension().lastPathComponent
+        return "\(fileName) \(program.displayName) chains"
+    }
+
+    private func structureJobTitle(chain: ProteinChainSequence, label: String) -> String {
+        let fileName = structureInputPath.isEmpty
+            ? chain.sourceName
+            : URL(fileURLWithPath: structureInputPath).deletingPathExtension().lastPathComponent
+        return "\(fileName) chain \(chain.chainID) \(label)"
+    }
+
+    private func structureOutputPath(basePath: String, chain: ProteinChainSequence, label: String, index: Int) -> String {
+        let trimmed = basePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.isEmpty ? defaultBlastOutputPath(for: configuration.program) : trimmed
+        let url = URL(fileURLWithPath: base)
+        let directory = url.deletingLastPathComponent()
+        let baseName = url.deletingPathExtension().lastPathComponent
+        let fileExtension = url.pathExtension.isEmpty ? "txt" : url.pathExtension
+        let safeLabel = label
+            .replacingOccurrences(of: " ", with: "-")
+            .replacingOccurrences(of: "/", with: "-")
+        let safeChain = chain.chainID.isEmpty ? "\(index + 1)" : chain.chainID
+        return directory
+            .appendingPathComponent("\(baseName)-chain-\(safeChain)-\(safeLabel)")
+            .appendingPathExtension(fileExtension)
+            .path
+    }
+
+    private func materializedStructureChainPath(chain: ProteinChainSequence, label: String) throws -> String {
+        let tempDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("LocalBlastStudio", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        let safeLabel = label
+            .replacingOccurrences(of: " ", with: "-")
+            .replacingOccurrences(of: "/", with: "-")
+        let safeChain = chain.chainID.isEmpty ? "unknown" : chain.chainID
+        let fileURL = tempDirectory.appendingPathComponent("structure-chain-\(safeChain)-\(safeLabel)-\(UUID().uuidString).fasta")
+        try chain.fastaRecord(label: label).write(to: fileURL, atomically: true, encoding: .utf8)
+        return fileURL.path
+    }
+
+    private func durationLabel(_ seconds: TimeInterval) -> String {
+        let totalSeconds = max(Int(seconds.rounded()), 0)
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        }
+        if minutes > 0 {
+            return "\(minutes)m \(seconds)s"
+        }
+        return "\(seconds)s"
     }
 
     func loadHelpForSelectedProgram() async {
@@ -2372,6 +3062,7 @@ private func databaseEntrySort(_ lhs: BlastDatabaseEntry, _ rhs: BlastDatabaseEn
 
 struct RunBlastView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var isStructureDropTargeted = false
 
     var availableDatabases: [BlastDatabaseEntry] {
         model.databaseCatalog
@@ -2427,7 +3118,9 @@ struct RunBlastView: View {
         VStack(alignment: .leading, spacing: 16) {
             programSection
             querySection
-            if model.configuration.alignTwoSequences {
+            if model.configuration.program.isIgBlast {
+                igBlastSection
+            } else if model.configuration.alignTwoSequences {
                 subjectSection
             } else {
                 databaseSection
@@ -2470,10 +3163,17 @@ struct RunBlastView: View {
                     .foregroundStyle(.secondary)
             }
             LabeledContent("Database") {
-                Text(model.configuration.alignTwoSequences ? "Subject sequence" : model.configuration.program.databaseKind.rawValue)
+                Text(databaseKindLabel)
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private var databaseKindLabel: String {
+        if model.configuration.program.isIgBlast {
+            return model.configuration.program == .igblastn ? "Germline V(D)J databases" : "Germline V database"
+        }
+        return model.configuration.alignTwoSequences ? "Subject sequence" : model.configuration.program.databaseKind.rawValue
     }
 
     private var querySection: some View {
@@ -2495,13 +3195,118 @@ struct RunBlastView: View {
                 placeholder: "Paste FASTA here when no query file is selected"
             )
 
+            if model.supportsStructureQueryImport {
+                structureImportSection
+            }
+
             HStack {
                 TextField("Query range, e.g. 1-250", text: $model.configuration.querySubrange)
                     .textFieldStyle(.roundedBorder)
-                Toggle("Align two sequences", isOn: $model.configuration.alignTwoSequences)
-                    .toggleStyle(.checkbox)
+                if model.configuration.program.supportsPairwiseAlignment {
+                    Toggle("Align two sequences", isOn: $model.configuration.alignTwoSequences)
+                        .toggleStyle(.checkbox)
+                } else {
+                    Label("Germline assignment", systemImage: "scope")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
+    }
+
+    private var structureImportSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("PDB/mmCIF Structure", systemImage: "cube")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Button {
+                    if let path = OpenPanel.chooseFile(allowedExtensions: ["pdb", "ent", "cif", "mmcif"]) {
+                        model.importStructureFile(path)
+                    }
+                } label: {
+                    Label("Choose", systemImage: "folder")
+                }
+                if !model.structureChains.isEmpty {
+                    Button {
+                        model.clearStructureFile()
+                    } label: {
+                        Label("Clear", systemImage: "xmark.circle")
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                if model.structureChains.isEmpty {
+                    Text(model.configuration.program == .igblastp
+                        ? "Drop a PDB or mmCIF file. IgBLASTP will use chain A as LC and chain B as HC."
+                        : "Drop a PDB or mmCIF file. BLASTP will run each protein chain as a linked job.")
+                    .foregroundStyle(.secondary)
+                } else {
+                    Text(URL(fileURLWithPath: model.structureInputPath).lastPathComponent)
+                        .font(.caption.weight(.semibold))
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 96), spacing: 6)], alignment: .leading, spacing: 6) {
+                        ForEach(model.structureChains) { chain in
+                            Label("Chain \(chain.chainID): \(chain.sequence.count) aa", systemImage: chainRoleIcon(chain))
+                                .font(.caption)
+                                .lineLimit(1)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.accentColor.opacity(0.10))
+                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
+                    }
+                    if !model.structureImportLog.isEmpty {
+                        Text(model.structureImportLog)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isStructureDropTargeted ? Color.accentColor.opacity(0.14) : Color(nsColor: .textBackgroundColor))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(
+                        isStructureDropTargeted ? Color.accentColor : Color.secondary.opacity(0.25),
+                        style: StrokeStyle(lineWidth: 1.5, dash: [6, 4])
+                    )
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isStructureDropTargeted) { providers in
+                handleStructureDrop(providers)
+            }
+        }
+    }
+
+    private func chainRoleIcon(_ chain: ProteinChainSequence) -> String {
+        if model.configuration.program == .igblastp {
+            if chain.chainID.caseInsensitiveCompare("A") == .orderedSame { return "l.circle" }
+            if chain.chainID.caseInsensitiveCompare("B") == .orderedSame { return "h.circle" }
+        }
+        return "circle.hexagongrid"
+    }
+
+    private func handleStructureDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else {
+            return false
+        }
+        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+            let url: URL?
+            if let itemURL = item as? URL {
+                url = itemURL
+            } else if let data = item as? Data {
+                url = URL(dataRepresentation: data, relativeTo: nil)
+            } else {
+                url = nil
+            }
+            guard let url else { return }
+            Task { @MainActor in
+                model.importStructureFile(url.path)
+            }
+        }
+        return true
     }
 
     private var subjectSection: some View {
@@ -2553,11 +3358,135 @@ struct RunBlastView: View {
         }
     }
 
+    private var igBlastSection: some View {
+        Panel(title: "IgBLAST Germline Setup", systemImage: "scope") {
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                GridRow {
+                    Text("Organism")
+                        .frame(width: 190, alignment: .leading)
+                    TextField("human", text: $model.configuration.igBlast.organism)
+                        .textFieldStyle(.roundedBorder)
+                }
+                GridRow {
+                    Text("Sequence type")
+                        .frame(width: 190, alignment: .leading)
+                    Picker("Sequence type", selection: $model.configuration.igBlast.sequenceType) {
+                        Text("Immunoglobulin").tag("Ig")
+                        Text("T cell receptor").tag("TCR")
+                    }
+                    .labelsHidden()
+                }
+                GridRow {
+                    Text("IGDATA directory")
+                        .frame(width: 190, alignment: .leading)
+                    HStack {
+                        TextField("Folder containing internal_data and optional_file", text: $model.configuration.igBlast.igDataDirectory)
+                            .textFieldStyle(.roundedBorder)
+                        Button {
+                            if let path = OpenPanel.chooseDirectory() {
+                                model.configuration.igBlast.igDataDirectory = path
+                            }
+                        } label: {
+                            Image(systemName: "folder")
+                        }
+                        .help("Choose the IgBLAST release support-data folder.")
+                    }
+                }
+                GridRow {
+                    Color.clear.frame(width: 190, height: 0)
+                    Text("IgBLAST uses IGDATA to find internal_data and optional_file support files. Leave it empty if your shell environment already provides IGDATA.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                GridRow {
+                    Text("Germline V database")
+                        .frame(width: 190, alignment: .leading)
+                    TextField("database/human_gl_V or an absolute database prefix", text: $model.configuration.igBlast.germlineVDatabase)
+                        .textFieldStyle(.roundedBorder)
+                }
+                if model.configuration.program == .igblastn {
+                    GridRow {
+                        Text("Germline D database")
+                            .frame(width: 190, alignment: .leading)
+                        TextField("database/human_gl_D", text: $model.configuration.igBlast.germlineDDatabase)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    GridRow {
+                        Text("Germline J database")
+                            .frame(width: 190, alignment: .leading)
+                        TextField("database/human_gl_J", text: $model.configuration.igBlast.germlineJDatabase)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    GridRow {
+                        Text("C region database")
+                            .frame(width: 190, alignment: .leading)
+                        TextField("Optional constant-region database prefix", text: $model.configuration.igBlast.cRegionDatabase)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    GridRow {
+                        Text("Auxiliary data")
+                            .frame(width: 190, alignment: .leading)
+                        HStack {
+                            TextField("optional_file/human_gl.aux", text: $model.configuration.igBlast.auxiliaryDataPath)
+                                .textFieldStyle(.roundedBorder)
+                            Button {
+                                if let path = OpenPanel.chooseFile(allowedExtensions: ["aux", "txt"]) {
+                                    model.configuration.igBlast.auxiliaryDataPath = path
+                                }
+                            } label: {
+                                Image(systemName: "folder")
+                            }
+                            .help("Choose an IgBLAST auxiliary data file.")
+                        }
+                    }
+                }
+                GridRow {
+                    Text("Additional database")
+                        .frame(width: 190, alignment: .leading)
+                    Picker("Additional database", selection: $model.configuration.igBlast.additionalDatabaseName) {
+                        Text("None").tag("")
+                        ForEach(availableDatabases) { database in
+                            Text("\(database.name)\(database.isInstalled ? "" : " - not installed")")
+                                .tag(database.name)
+                        }
+                    }
+                    .labelsHidden()
+                }
+                GridRow {
+                    Color.clear.frame(width: 190, height: 0)
+                    TextField("Additional database name or path", text: $model.configuration.igBlast.additionalDatabaseName)
+                        .textFieldStyle(.roundedBorder)
+                }
+                GridRow {
+                    Text("Additional DB dir")
+                        .frame(width: 190, alignment: .leading)
+                    HStack {
+                        TextField("BLASTDB folder for the optional additional database", text: $model.configuration.igBlast.additionalDatabaseDirectory)
+                            .textFieldStyle(.roundedBorder)
+                        Button {
+                            if let path = OpenPanel.chooseDirectory() {
+                                model.configuration.igBlast.additionalDatabaseDirectory = path
+                            }
+                        } label: {
+                            Image(systemName: "folder")
+                        }
+                    }
+                }
+                GridRow {
+                    Color.clear.frame(width: 190, height: 0)
+                    Text("The V database is required. D, J, C, auxiliary data, and an additional search database can be supplied when your IgBLAST release or assay needs them.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
     private var advancedSection: some View {
         Panel(title: "Advanced", systemImage: "terminal") {
-            TextField("Raw BLAST+ arguments, e.g. -dbsize 1000000 -parse_deflines", text: $model.configuration.rawArguments)
+            TextField("Raw BLAST+/IgBLAST arguments, e.g. -dbsize 1000000 -parse_deflines", text: $model.configuration.rawArguments)
                 .textFieldStyle(.roundedBorder)
-            Text("Raw arguments are appended last, so they can cover BLAST+ switches that are not exposed as structured controls yet.")
+            Text("Raw arguments are appended last, so they can cover BLAST+ and IgBLAST switches that are not exposed as structured controls yet.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -2572,13 +3501,27 @@ struct RunBlastView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             HStack {
+                Label(model.searchCapacityLabel, systemImage: "cpu")
+                    .font(.caption)
+                    .foregroundStyle(model.canStartSearch ? Color.secondary : Color.orange)
+                Spacer()
+            }
+            HStack {
                 Button {
                     Task { await model.runSearch() }
                 } label: {
-                    Label(model.isRunningSearch ? "Running" : "Run", systemImage: "play.fill")
+                    Label("Run", systemImage: "play.fill")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.isRunningSearch)
+                .disabled(!model.canStartSearch)
+
+                if model.isRunningSearch {
+                    Button(role: .destructive) {
+                        model.killAllRunningJobs()
+                    } label: {
+                        Label("Kill Running", systemImage: "xmark.octagon")
+                    }
+                }
 
                 Button {
                     if let path = OpenPanel.saveFile(defaultName: "blast-result.txt") {
@@ -2973,6 +3916,7 @@ struct ParameterEditorView: View {
     private func icon(for group: String) -> String {
         switch group {
         case "General": "slider.horizontal.3"
+        case "IgBLAST": "scope"
         case "Scoring": "sum"
         case "Filters": "line.3.horizontal.decrease.circle"
         case "Algorithm": "gearshape.2"
@@ -3969,8 +4913,8 @@ struct ToolsView: View {
     var body: some View {
         VStack(spacing: 0) {
             HeaderBar(
-                title: "BLAST+ Tools",
-                subtitle: "Point the app at an NCBI BLAST+ bin folder, then verify the full local suite."
+                title: "BLAST+ And IgBLAST Tools",
+                subtitle: "Point the app at an NCBI BLAST+/IgBLAST bin folder, then verify the local suite."
             ) {
                 Button {
                     Task { await model.refreshTools() }
@@ -4027,9 +4971,10 @@ struct ToolsView: View {
                     }
 
                     Panel(title: "Install Notes", systemImage: "info.circle") {
-                        Text("Install NCBI BLAST+ from NCBI, Homebrew, or a managed lab image. LocalBlastStudio does not bundle NCBI binaries or databases; it orchestrates them locally so versioning and data provenance stay visible.")
+                        Text("Install NCBI BLAST+ and IgBLAST from NCBI, Homebrew, Conda, or a managed lab image. LocalBlastStudio does not bundle NCBI binaries or databases; it orchestrates them locally so versioning and data provenance stay visible.")
                             .foregroundStyle(.secondary)
                         Link("NCBI BLAST+ command line manual", destination: URL(string: "https://www.ncbi.nlm.nih.gov/books/NBK279690/")!)
+                        Link("NCBI IgBLAST", destination: URL(string: "https://www.ncbi.nlm.nih.gov/igblast/")!)
                         Link("NCBI BLAST database downloads", destination: URL(string: "https://www.ncbi.nlm.nih.gov/books/NBK569850/")!)
                     }
                 }
@@ -4116,7 +5061,18 @@ struct ResultsView: View {
 
             List(selection: $model.selectedJobID) {
                 ForEach(model.jobs) { job in
-                    ResultJobRow(job: job)
+                    HStack(alignment: .center, spacing: 8) {
+                        ResultJobRow(job: job)
+                        if model.isJobRunning(job.id) {
+                            Button(role: .destructive) {
+                                model.killJob(job.id)
+                            } label: {
+                                Image(systemName: "xmark.octagon")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Kill this running job")
+                        }
+                    }
                         .tag(job.id)
                 }
             }
@@ -4185,6 +5141,11 @@ struct ResultsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("\(job.kind.rawValue) · \(job.program.displayName)")
                         .font(.callout.weight(.semibold))
+                    if !job.linkedGroup.isEmpty {
+                        Label(job.linkedGroup, systemImage: "link")
+                            .font(.caption)
+                            .foregroundStyle(.blue)
+                    }
                     Text(job.outputPath)
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
@@ -4193,6 +5154,14 @@ struct ResultsView: View {
                         .textSelection(.enabled)
                 }
                 Spacer()
+                if model.isJobRunning(job.id) {
+                    Button(role: .destructive) {
+                        model.killJob(job.id)
+                    } label: {
+                        Label("Kill", systemImage: "xmark.octagon")
+                    }
+                    .buttonStyle(.bordered)
+                }
                 ResultStatusBadge(job: job)
             }
 
@@ -4201,6 +5170,7 @@ struct ResultsView: View {
                 SummaryMetric(label: "Hits", value: job.noHits ? "0" : job.hitCount.map { $0.formatted() } ?? "--")
                 SummaryMetric(label: "Output", value: ByteCountFormatter.string(fromByteCount: job.outputBytes, countStyle: .file))
                 SummaryMetric(label: "Runtime", value: durationLabel(job.duration))
+                SummaryMetric(label: "CPU", value: "\(job.reservedThreads) thread\(job.reservedThreads == 1 ? "" : "s")")
             }
 
             if !job.commandPreview.isEmpty {
@@ -4252,6 +5222,11 @@ struct ResultJobRow: View {
             HStack(spacing: 8) {
                 Text(job.program.displayName)
                     .font(.caption.weight(.semibold))
+                if !job.linkedGroup.isEmpty {
+                    Label("Linked", systemImage: "link")
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                }
                 Text(job.database.isEmpty ? job.kind.rawValue : job.database)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -4264,6 +5239,7 @@ struct ResultJobRow: View {
                     .foregroundStyle(statusColor)
                 Text(job.noHits ? "No hits" : hitLabel)
                 Text(ByteCountFormatter.string(fromByteCount: job.outputBytes, countStyle: .file))
+                Text("\(job.reservedThreads) CPU")
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -4290,6 +5266,8 @@ struct ResultJobRow: View {
             "checkmark.circle.fill"
         case .failed:
             "exclamationmark.triangle.fill"
+        case .killed:
+            "xmark.octagon.fill"
         case .imported:
             "tray.and.arrow.down.fill"
         }
@@ -4303,6 +5281,8 @@ struct ResultJobRow: View {
             .green
         case .failed:
             .orange
+        case .killed:
+            .red
         case .imported:
             .secondary
         }
@@ -4337,6 +5317,8 @@ struct ResultStatusBadge: View {
             "checkmark.circle.fill"
         case .failed:
             "exclamationmark.triangle.fill"
+        case .killed:
+            "xmark.octagon.fill"
         case .imported:
             "tray.and.arrow.down.fill"
         }
@@ -4350,6 +5332,8 @@ struct ResultStatusBadge: View {
             .green
         case .failed:
             .orange
+        case .killed:
+            .red
         case .imported:
             .secondary
         }
@@ -4375,6 +5359,9 @@ struct BlastResultReportView: View {
     var body: some View {
         Panel(title: "BLAST Report", systemImage: "target") {
             reportSummary
+            if !report.igBlastDomainRegions.isEmpty {
+                domainAnnotationStrip
+            }
 
             Picker("Result view", selection: $selectedPane) {
                 ForEach(BlastResultPane.allCases) { pane in
@@ -4430,6 +5417,38 @@ struct BlastResultReportView: View {
             }
         }
         .font(.callout)
+    }
+
+    private var domainAnnotationStrip: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("IgBLAST Domains")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            ScrollView(.horizontal) {
+                HStack(spacing: 6) {
+                    ForEach(report.igBlastDomainRegions) { region in
+                        Text(domainBracketLabel(region))
+                            .font(.system(.caption, design: .monospaced))
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(domainColor(for: region).opacity(0.12))
+                            .foregroundStyle(domainColor(for: region))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
+
+    private func domainBracketLabel(_ region: IgBlastDomainRegion) -> String {
+        let range = region.rangeLabel.isEmpty ? "" : " \(region.rangeLabel)"
+        return "<\(region.displayName)\(range)>"
+    }
+
+    private func domainColor(for region: IgBlastDomainRegion) -> Color {
+        region.name.hasPrefix("CDR") ? .purple : .blue
     }
 
     private func summaryLabel(_ value: String) -> some View {
@@ -4573,12 +5592,193 @@ struct BlastResultReportView: View {
 
     private var rawPane: some View {
         ScrollView([.horizontal, .vertical]) {
-            Text(report.rawText)
+            Text(rawPaneText)
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(minHeight: 300, maxHeight: 620)
+    }
+
+    private var rawPaneText: String {
+        guard !report.igBlastDomainRegions.isEmpty else {
+            return report.rawText
+        }
+
+        let annotatedRawText = rawTextWithIgBlastDomainRulers(report.rawText)
+        let brackets = report.igBlastDomainRegions
+            .map { domainBracketLabel($0) }
+            .joined(separator: " ")
+        let rows = report.igBlastDomainRegions
+            .map { region in
+                let range = region.rangeLabel.isEmpty ? "--" : region.rangeLabel
+                return "\(region.displayName)\t\(range)"
+            }
+            .joined(separator: "\n")
+
+        return """
+        LocalBlastStudio parsed IgBLAST domain brackets:
+        \(brackets)
+
+        Parsed domain ranges:
+        \(rows)
+
+        Native IgBLAST output:
+        \(annotatedRawText)
+        """
+    }
+
+    private func rawTextWithIgBlastDomainRulers(_ rawText: String) -> String {
+        guard let cdr3Region = report.igBlastDomainRegions.first(where: { $0.name.hasPrefix("CDR3") }) else {
+            return rawText
+        }
+        guard !rawText.contains(domainBracketLabel(cdr3Region)) else {
+            return rawText
+        }
+        guard let cdr3Start = Int(cdr3Region.from), let cdr3End = Int(cdr3Region.to) else {
+            return rawText
+        }
+
+        let queryID = report.query
+        var lines = rawText.components(separatedBy: "\n")
+        var alignmentsStarted = false
+        var insertions: [(index: Int, line: String)] = []
+
+        for index in lines.indices {
+            let line = lines[index]
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.lowercased() == "alignments" {
+                alignmentsStarted = true
+                continue
+            }
+            guard alignmentsStarted else { continue }
+
+            let tokens = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard tokens.count >= 4 else { continue }
+            guard queryID.isEmpty || tokens[0] == queryID else { continue }
+            guard let queryStart = Int(tokens[1]), let queryEnd = Int(tokens[tokens.count - 1]) else { continue }
+            guard queryStart <= cdr3End, queryEnd >= cdr3Start else { continue }
+
+            let sequenceToken = tokens[tokens.count - 2]
+            let sequenceColumn = leadingColumnCount(before: sequenceToken, in: line)
+            let overlapStart = max(cdr3Start, queryStart)
+            let overlapEnd = min(cdr3End, queryEnd)
+            let markerStartColumn = sequenceColumn + max(overlapStart - queryStart, 0)
+            let markerEndColumn = sequenceColumn + max(overlapEnd - queryStart, 0) + 1
+            let includesStart = queryStart <= cdr3Start && cdr3Start <= queryEnd
+            let includesEnd = queryStart <= cdr3End && cdr3End <= queryEnd
+            let label = includesEnd ? "\(cdr3Region.displayName) \(cdr3Region.rangeLabel)" : ""
+            let rulerLine = domainRulerLine(
+                startColumn: markerStartColumn,
+                endColumn: markerEndColumn,
+                includesStart: includesStart,
+                includesEnd: includesEnd,
+                trailingLabel: label
+            )
+            if !rulerLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if includesStart, let rulerIndex = previousDomainRulerIndex(before: index, in: lines) {
+                    lines[rulerIndex] = overlayRulerLine(rulerLine, onto: lines[rulerIndex])
+                } else {
+                    insertions.append((index: index, line: rulerLine))
+                }
+            }
+        }
+
+        if !insertions.isEmpty {
+            for insertion in insertions.sorted(by: { $0.index > $1.index }) {
+                lines.insert(insertion.line, at: insertion.index)
+            }
+            return lines.joined(separator: "\n")
+        }
+
+        if let alignmentIndex = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "alignments"
+        }) {
+            lines.insert(domainBracketLabel(cdr3Region), at: lines.index(after: alignmentIndex))
+            return lines.joined(separator: "\n")
+        }
+
+        return rawText
+    }
+
+    private func previousDomainRulerIndex(before index: Int, in lines: [String]) -> Int? {
+        guard index > 0 else { return nil }
+        for candidate in stride(from: index - 1, through: 0, by: -1) {
+            let trimmed = lines[candidate].trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                continue
+            }
+            if trimmed.contains("<"), trimmed.contains(">") {
+                return candidate
+            }
+            return nil
+        }
+        return nil
+    }
+
+    private func overlayRulerLine(_ overlay: String, onto base: String) -> String {
+        var baseCharacters = Array(base)
+        let overlayCharacters = Array(overlay)
+        if baseCharacters.count < overlayCharacters.count {
+            baseCharacters.append(contentsOf: Array(repeating: Character(" "), count: overlayCharacters.count - baseCharacters.count))
+        }
+
+        for (index, character) in overlayCharacters.enumerated() where character != " " {
+            baseCharacters[index] = character
+        }
+
+        var line = String(baseCharacters)
+        while line.last == " " {
+            line.removeLast()
+        }
+        return line
+    }
+
+    private func domainRulerLine(
+        startColumn: Int,
+        endColumn: Int,
+        includesStart: Bool,
+        includesEnd: Bool,
+        trailingLabel: String
+    ) -> String {
+        let safeStartColumn = max(startColumn, 0)
+        let safeEndColumn = max(endColumn, safeStartColumn + 1)
+        let closeColumn = includesEnd ? max(safeEndColumn - 1, safeStartColumn) : safeEndColumn
+        let openColumn = includesStart ? min(safeStartColumn + 1, closeColumn) : safeStartColumn
+        let lastColumn = max(openColumn, closeColumn)
+        var characters = Array(repeating: Character(" "), count: lastColumn + 1)
+
+        if includesStart {
+            characters[openColumn] = "<"
+        }
+
+        let dashStart = includesStart ? openColumn + 1 : safeStartColumn
+        let dashEnd = includesEnd ? closeColumn : safeEndColumn
+        if dashStart < dashEnd {
+            for column in dashStart..<dashEnd {
+                characters[column] = "-"
+            }
+        }
+
+        if includesEnd {
+            characters[closeColumn] = ">"
+        }
+
+        var line = String(characters)
+        while line.last == " " {
+            line.removeLast()
+        }
+        if includesEnd, !trailingLabel.isEmpty {
+            line += " \(trailingLabel)"
+        }
+        return line
+    }
+
+    private func leadingColumnCount(before token: String, in line: String) -> Int {
+        guard let range = line.range(of: token) else {
+            return 0
+        }
+        return line.distance(from: line.startIndex, to: range.lowerBound)
     }
 
     private func tableHeader(_ value: String) -> some View {

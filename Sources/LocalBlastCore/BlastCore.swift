@@ -17,9 +17,26 @@ public enum BlastProgram: String, CaseIterable, Codable, Identifiable, Sendable 
     case rpsblast
     case rpstblastn
     case deltablast
+    case igblastn
+    case igblastp
 
     public var id: String { rawValue }
     public var executableName: String { rawValue }
+
+    public static let blastPlusPrograms: Set<BlastProgram> = [
+        .blastn, .blastp, .blastx, .tblastn, .tblastx,
+        .psiblast, .rpsblast, .rpstblastn, .deltablast
+    ]
+
+    public static let igBlastPrograms: Set<BlastProgram> = [.igblastn, .igblastp]
+
+    public var isIgBlast: Bool {
+        Self.igBlastPrograms.contains(self)
+    }
+
+    public var supportsPairwiseAlignment: Bool {
+        !isIgBlast
+    }
 
     public var displayName: String {
         switch self {
@@ -32,23 +49,25 @@ public enum BlastProgram: String, CaseIterable, Codable, Identifiable, Sendable 
         case .rpsblast: "RPS-BLAST"
         case .rpstblastn: "RPSTBLASTN"
         case .deltablast: "DELTA-BLAST"
+        case .igblastn: "IgBLASTN"
+        case .igblastp: "IgBLASTP"
         }
     }
 
     public var queryKind: SequenceKind {
         switch self {
-        case .blastn, .blastx, .tblastx, .rpstblastn:
+        case .blastn, .blastx, .tblastx, .rpstblastn, .igblastn:
             .nucleotide
-        case .blastp, .tblastn, .psiblast, .rpsblast, .deltablast:
+        case .blastp, .tblastn, .psiblast, .rpsblast, .deltablast, .igblastp:
             .protein
         }
     }
 
     public var databaseKind: SequenceKind {
         switch self {
-        case .blastn, .tblastn, .tblastx:
+        case .blastn, .tblastn, .tblastx, .igblastn:
             .nucleotide
-        case .blastp, .blastx, .psiblast, .deltablast:
+        case .blastp, .blastx, .psiblast, .deltablast, .igblastp:
             .protein
         case .rpsblast, .rpstblastn:
             .conservedDomain
@@ -75,6 +94,10 @@ public enum BlastProgram: String, CaseIterable, Codable, Identifiable, Sendable 
             "Translated nucleotide query against conserved domain profile databases."
         case .deltablast:
             "Protein search seeded from conserved domain matches."
+        case .igblastn:
+            "Nucleotide immunoglobulin or T cell receptor query against germline V(D)J databases."
+        case .igblastp:
+            "Protein immunoglobulin or T cell receptor query against a germline V database."
         }
     }
 
@@ -172,7 +195,7 @@ public struct BlastOption: Identifiable, Codable, Hashable, Sendable {
         defaultValue: String = "",
         choices: [BlastOptionChoice] = [],
         help: String,
-        supportedPrograms: Set<BlastProgram> = Set(BlastProgram.allCases),
+        supportedPrograms: Set<BlastProgram> = BlastProgram.blastPlusPrograms,
         argumentKind: BlastArgumentKind = .value,
         includeWhenDefault: Bool = false
     ) {
@@ -277,6 +300,115 @@ public enum BlastParameterCatalog {
             control: .integer,
             defaultValue: "4",
             help: "Number of local CPU threads to use. Ignored by remote searches."
+        ),
+        BlastOption(
+            id: "igOutfmt",
+            flag: "-outfmt",
+            title: "Alignment format",
+            group: "IgBLAST",
+            control: .picker,
+            defaultValue: "3",
+            choices: [
+                .init("3", "Flat query-anchored with identities"),
+                .init("4", "Flat query-anchored without identities"),
+                .init("7", "Tabular with comments"),
+                .init("19", "AIRR rearrangement tabular")
+            ],
+            help: "IgBLAST-specific output format. Format 19 writes AIRR rearrangement TSV.",
+            supportedPrograms: [.igblastn]
+        ),
+        BlastOption(
+            id: "igOutfmt",
+            flag: "-outfmt",
+            title: "Alignment format",
+            group: "IgBLAST",
+            control: .picker,
+            defaultValue: "3",
+            choices: [
+                .init("3", "Flat query-anchored with identities"),
+                .init("4", "Flat query-anchored without identities"),
+                .init("7", "Tabular with comments")
+            ],
+            help: "IgBLASTP output format. AIRR rearrangement TSV is supported by IgBLASTN only.",
+            supportedPrograms: [.igblastp]
+        ),
+        BlastOption(
+            id: "igDomainSystem",
+            flag: "-domain_system",
+            title: "V domain system",
+            group: "IgBLAST",
+            control: .picker,
+            defaultValue: "imgt",
+            choices: [
+                .init("imgt", "IMGT"),
+                .init("kabat", "Kabat")
+            ],
+            help: "Numbering system used to delineate framework and CDR regions.",
+            supportedPrograms: BlastProgram.igBlastPrograms
+        ),
+        BlastOption(
+            id: "showTranslation",
+            flag: "-show_translation",
+            title: "Show translation",
+            group: "IgBLAST",
+            control: .checkbox,
+            defaultValue: "false",
+            help: "Show amino-acid translation for nucleotide IgBLAST reports.",
+            supportedPrograms: [.igblastn],
+            argumentKind: .flagWhenTrue
+        ),
+        BlastOption(
+            id: "extendAlign5End",
+            flag: "-extend_align5end",
+            title: "Extend 5' alignment",
+            group: "IgBLAST",
+            control: .checkbox,
+            defaultValue: "false",
+            help: "Show simple gapless extension into the 5' end of the V gene when local alignment misses bases.",
+            supportedPrograms: BlastProgram.igBlastPrograms,
+            argumentKind: .flagWhenTrue
+        ),
+        BlastOption(
+            id: "extendAlign3End",
+            flag: "-extend_align3end",
+            title: "Extend 3' alignment",
+            group: "IgBLAST",
+            control: .checkbox,
+            defaultValue: "false",
+            help: "Show simple gapless extension into the 3' end of the J gene when local alignment misses bases.",
+            supportedPrograms: [.igblastn],
+            argumentKind: .flagWhenTrue
+        ),
+        BlastOption(
+            id: "allowVDJOverlap",
+            flag: "-allow_vdj_overlap",
+            title: "Allow V(D)J overlap",
+            group: "IgBLAST",
+            control: .checkbox,
+            defaultValue: "false",
+            help: "Allow V, D, and J assignments to share overlapping bases at rearrangement junctions.",
+            supportedPrograms: [.igblastn],
+            argumentKind: .flagWhenTrue
+        ),
+        BlastOption(
+            id: "igEvalue",
+            flag: "-evalue",
+            title: "Additional DB expect",
+            group: "IgBLAST",
+            control: .decimal,
+            defaultValue: "10",
+            help: "Expect threshold for the optional additional non-germline database search.",
+            supportedPrograms: BlastProgram.igBlastPrograms
+        ),
+        BlastOption(
+            id: "numAlignments",
+            flag: "-num_alignments",
+            title: "Additional alignments",
+            group: "IgBLAST",
+            control: .integer,
+            defaultValue: "50",
+            help: "Number of alignments to show for the optional additional database search.",
+            supportedPrograms: BlastProgram.igBlastPrograms
         ),
         BlastOption(
             id: "strand",
@@ -592,7 +724,7 @@ public enum BlastParameterCatalog {
 
     public static var groups: [String] {
         Array(Set(options.map(\.group))).sorted { lhs, rhs in
-            let order = ["General", "Scoring", "Filters", "Algorithm", "Results", "Output", "PSI-BLAST"]
+            let order = ["General", "IgBLAST", "Scoring", "Filters", "Algorithm", "Results", "Output", "PSI-BLAST"]
             return (order.firstIndex(of: lhs) ?? Int.max, lhs) < (order.firstIndex(of: rhs) ?? Int.max, rhs)
         }
     }
@@ -697,6 +829,382 @@ public enum FallbackDatabaseCatalog {
     ]
 }
 
+public struct ProteinChainSequence: Identifiable, Codable, Hashable, Sendable {
+    public var chainID: String
+    public var sequence: String
+    public var sourceName: String
+
+    public var id: String { chainID }
+
+    public init(chainID: String, sequence: String, sourceName: String = "") {
+        self.chainID = chainID
+        self.sequence = sequence
+        self.sourceName = sourceName
+    }
+
+    public func fastaRecord(label: String? = nil) -> String {
+        let safeSource = sourceName
+            .replacingOccurrences(of: " ", with: "_")
+            .replacingOccurrences(of: "|", with: "_")
+        let safeChain = chainID.isEmpty ? "unknown" : chainID
+        let identifier = label.map { "\(safeSource)_chain_\(safeChain)_\($0)" } ?? "\(safeSource)_chain_\(safeChain)"
+        return ">\(identifier)\n\(Self.wrapped(sequence))\n"
+    }
+
+    private static func wrapped(_ sequence: String, width: Int = 80) -> String {
+        var lines: [String] = []
+        var current = ""
+        var count = 0
+        for character in sequence {
+            current.append(character)
+            count += 1
+            if count == width {
+                lines.append(current)
+                current = ""
+                count = 0
+            }
+        }
+        if !current.isEmpty {
+            lines.append(current)
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+public enum ProteinStructureParseError: Error, LocalizedError, Equatable {
+    case unsupportedFile(String)
+    case unreadableFile(String)
+    case noProteinChains(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedFile(let path):
+            "Unsupported structure file type: \(URL(fileURLWithPath: path).lastPathComponent)"
+        case .unreadableFile(let path):
+            "Could not read structure file: \(URL(fileURLWithPath: path).lastPathComponent)"
+        case .noProteinChains(let path):
+            "No protein chains could be extracted from \(URL(fileURLWithPath: path).lastPathComponent)."
+        }
+    }
+}
+
+public enum ProteinStructureSequenceExtractor {
+    public static func extract(fromFile path: String) throws -> [ProteinChainSequence] {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+            throw ProteinStructureParseError.unreadableFile(path)
+        }
+
+        let url = URL(fileURLWithPath: path)
+        let ext = url.pathExtension.lowercased()
+        let sourceName = url.deletingPathExtension().lastPathComponent
+        let chains: [ProteinChainSequence]
+        switch ext {
+        case "pdb", "ent":
+            chains = extractPDB(text, sourceName: sourceName)
+        case "cif", "mmcif":
+            chains = extractMMCIF(text, sourceName: sourceName)
+        default:
+            throw ProteinStructureParseError.unsupportedFile(path)
+        }
+
+        let proteinChains = chains
+            .map { chain in
+                ProteinChainSequence(
+                    chainID: chain.chainID,
+                    sequence: chain.sequence.filter { $0.isLetter || $0 == "*" },
+                    sourceName: sourceName
+                )
+            }
+            .filter { !$0.sequence.isEmpty }
+            .sorted { lhs, rhs in
+                lhs.chainID.localizedStandardCompare(rhs.chainID) == .orderedAscending
+            }
+        guard !proteinChains.isEmpty else {
+            throw ProteinStructureParseError.noProteinChains(path)
+        }
+        return proteinChains
+    }
+
+    private static func extractPDB(_ text: String, sourceName: String) -> [ProteinChainSequence] {
+        let seqres = extractPDBSEQRES(text, sourceName: sourceName)
+        if !seqres.isEmpty {
+            return seqres
+        }
+        return extractPDBAtomCA(text, sourceName: sourceName)
+    }
+
+    private static func extractPDBSEQRES(_ text: String, sourceName: String) -> [ProteinChainSequence] {
+        var residuesByChain: [String: [String]] = [:]
+        for line in text.components(separatedBy: .newlines) where line.hasPrefix("SEQRES") {
+            let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard parts.count >= 5 else { continue }
+            let chainID = parts[2].isEmpty ? "_" : parts[2]
+            let residues = parts.dropFirst(4).compactMap { aminoAcidCode(for: $0) }
+            residuesByChain[chainID, default: []].append(contentsOf: residues)
+        }
+        return residuesByChain.map { chainID, residues in
+            ProteinChainSequence(chainID: chainID, sequence: residues.joined(), sourceName: sourceName)
+        }
+    }
+
+    private static func extractPDBAtomCA(_ text: String, sourceName: String) -> [ProteinChainSequence] {
+        var residuesByChain: [String: [String]] = [:]
+        var seenResidues = Set<String>()
+        for line in text.components(separatedBy: .newlines) where line.hasPrefix("ATOM") || line.hasPrefix("HETATM") {
+            let atomName = fixedWidthField(line, start: 12, end: 16).trimmingCharacters(in: .whitespaces)
+            guard atomName == "CA" else { continue }
+            let residueName = fixedWidthField(line, start: 17, end: 20).trimmingCharacters(in: .whitespaces)
+            guard let code = aminoAcidCode(for: residueName) else { continue }
+            let chainID = fixedWidthField(line, start: 21, end: 22).trimmingCharacters(in: .whitespaces)
+            let normalizedChainID = chainID.isEmpty ? "_" : chainID
+            let residueID = fixedWidthField(line, start: 22, end: 27).trimmingCharacters(in: .whitespaces)
+            let key = "\(normalizedChainID)|\(residueID)"
+            guard !seenResidues.contains(key) else { continue }
+            seenResidues.insert(key)
+            residuesByChain[normalizedChainID, default: []].append(code)
+        }
+        return residuesByChain.map { chainID, residues in
+            ProteinChainSequence(chainID: chainID, sequence: residues.joined(), sourceName: sourceName)
+        }
+    }
+
+    private static func extractMMCIF(_ text: String, sourceName: String) -> [ProteinChainSequence] {
+        let tokens = mmcifTokens(text)
+        var index = 0
+        var residuesByChain: [String: [String]] = [:]
+        var seenResidues = Set<String>()
+
+        while index < tokens.count {
+            guard tokens[index] == "loop_" else {
+                index += 1
+                continue
+            }
+            index += 1
+            var headers: [String] = []
+            while index < tokens.count, tokens[index].hasPrefix("_") {
+                headers.append(tokens[index])
+                index += 1
+            }
+
+            guard headers.contains(where: { $0.hasPrefix("_atom_site.") }) else {
+                while index < tokens.count, tokens[index] != "loop_", !tokens[index].hasPrefix("_") {
+                    index += 1
+                }
+                continue
+            }
+
+            let groupIndex = indexOf(headers, "_atom_site.group_PDB")
+            let atomIndex = indexOf(headers, "_atom_site.label_atom_id") ?? indexOf(headers, "_atom_site.auth_atom_id")
+            let compIndex = indexOf(headers, "_atom_site.label_comp_id") ?? indexOf(headers, "_atom_site.auth_comp_id")
+            let chainIndex = indexOf(headers, "_atom_site.auth_asym_id") ?? indexOf(headers, "_atom_site.label_asym_id")
+            let seqIndex = indexOf(headers, "_atom_site.auth_seq_id") ?? indexOf(headers, "_atom_site.label_seq_id")
+            let insIndex = indexOf(headers, "_atom_site.pdbx_PDB_ins_code")
+
+            while index + headers.count <= tokens.count {
+                if tokens[index] == "loop_" || tokens[index].hasPrefix("_") || tokens[index].hasPrefix("data_") {
+                    break
+                }
+                let row = Array(tokens[index..<index + headers.count])
+                index += headers.count
+
+                if let groupIndex, row.indices.contains(groupIndex), row[groupIndex] != "ATOM" {
+                    continue
+                }
+                guard let atomIndex, row.indices.contains(atomIndex), row[atomIndex] == "CA" else { continue }
+                guard let compIndex, row.indices.contains(compIndex),
+                      let code = aminoAcidCode(for: row[compIndex]) else { continue }
+
+                let chainID = chainIndex.flatMap { row.indices.contains($0) ? row[$0] : nil } ?? "_"
+                let seqID = seqIndex.flatMap { row.indices.contains($0) ? row[$0] : nil } ?? "\(index)"
+                let insID = insIndex.flatMap { row.indices.contains($0) ? row[$0] : nil } ?? ""
+                let normalizedChainID = normalizeMissingCIFValue(chainID, fallback: "_")
+                let key = "\(normalizedChainID)|\(seqID)|\(insID)"
+                guard !seenResidues.contains(key) else { continue }
+                seenResidues.insert(key)
+                residuesByChain[normalizedChainID, default: []].append(code)
+            }
+        }
+
+        return residuesByChain.map { chainID, residues in
+            ProteinChainSequence(chainID: chainID, sequence: residues.joined(), sourceName: sourceName)
+        }
+    }
+
+    private static func fixedWidthField(_ line: String, start: Int, end: Int) -> String {
+        let characters = Array(line)
+        guard start < characters.count else { return "" }
+        let upper = min(end, characters.count)
+        guard start < upper else { return "" }
+        return String(characters[start..<upper])
+    }
+
+    private static func indexOf(_ headers: [String], _ name: String) -> Int? {
+        headers.firstIndex(of: name)
+    }
+
+    private static func normalizeMissingCIFValue(_ value: String, fallback: String) -> String {
+        value == "." || value == "?" || value.isEmpty ? fallback : value
+    }
+
+    private static func mmcifTokens(_ text: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var quote: Character?
+        var atLineStart = true
+        var iterator = text.makeIterator()
+
+        func flush() {
+            if !current.isEmpty {
+                tokens.append(current)
+                current.removeAll(keepingCapacity: true)
+            }
+        }
+
+        while let character = iterator.next() {
+            if let quoteCharacter = quote {
+                if character == quoteCharacter {
+                    quote = nil
+                } else {
+                    current.append(character)
+                }
+                atLineStart = character == "\n"
+                continue
+            }
+
+            if atLineStart, character == ";" {
+                flush()
+                var block = ""
+                var previousWasNewline = false
+                while let blockCharacter = iterator.next() {
+                    if previousWasNewline, blockCharacter == ";" {
+                        break
+                    }
+                    block.append(blockCharacter)
+                    previousWasNewline = blockCharacter == "\n"
+                }
+                tokens.append(block.trimmingCharacters(in: .whitespacesAndNewlines))
+                atLineStart = true
+                continue
+            }
+
+            if character == "#" {
+                flush()
+                while let skipped = iterator.next(), skipped != "\n" { }
+                atLineStart = true
+                continue
+            }
+
+            if character == "'" || character == "\"" {
+                flush()
+                quote = character
+                atLineStart = false
+                continue
+            }
+
+            if character.isWhitespace {
+                flush()
+                atLineStart = character == "\n"
+            } else {
+                current.append(character)
+                atLineStart = false
+            }
+        }
+        flush()
+        return tokens
+    }
+
+    private static func aminoAcidCode(for rawName: String) -> String? {
+        switch rawName.uppercased() {
+        case "ALA": "A"
+        case "ARG": "R"
+        case "ASN": "N"
+        case "ASP": "D"
+        case "CYS": "C"
+        case "GLN": "Q"
+        case "GLU": "E"
+        case "GLY": "G"
+        case "HIS": "H"
+        case "ILE": "I"
+        case "LEU": "L"
+        case "LYS": "K"
+        case "MET", "MSE": "M"
+        case "PHE": "F"
+        case "PRO": "P"
+        case "SER": "S"
+        case "THR": "T"
+        case "TRP": "W"
+        case "TYR": "Y"
+        case "VAL": "V"
+        case "ASX": "B"
+        case "GLX": "Z"
+        case "SEC": "U"
+        case "PYL": "O"
+        case "UNK": "X"
+        default: nil
+        }
+    }
+}
+
+public struct IgBlastConfiguration: Codable, Equatable, Sendable {
+    public var organism: String
+    public var sequenceType: String
+    public var igDataDirectory: String
+    public var germlineVDatabase: String
+    public var germlineDDatabase: String
+    public var germlineJDatabase: String
+    public var cRegionDatabase: String
+    public var auxiliaryDataPath: String
+    public var additionalDatabaseName: String
+    public var additionalDatabaseDirectory: String
+
+    public init(
+        organism: String = "human",
+        sequenceType: String = "Ig",
+        igDataDirectory: String = "",
+        germlineVDatabase: String = "",
+        germlineDDatabase: String = "",
+        germlineJDatabase: String = "",
+        cRegionDatabase: String = "",
+        auxiliaryDataPath: String = "",
+        additionalDatabaseName: String = "",
+        additionalDatabaseDirectory: String = ""
+    ) {
+        self.organism = organism
+        self.sequenceType = sequenceType
+        self.igDataDirectory = igDataDirectory
+        self.germlineVDatabase = germlineVDatabase
+        self.germlineDDatabase = germlineDDatabase
+        self.germlineJDatabase = germlineJDatabase
+        self.cRegionDatabase = cRegionDatabase
+        self.auxiliaryDataPath = auxiliaryDataPath
+        self.additionalDatabaseName = additionalDatabaseName
+        self.additionalDatabaseDirectory = additionalDatabaseDirectory
+    }
+
+    public var searchTargetDescription: String {
+        searchTargetDescription(for: .igblastn)
+    }
+
+    public func searchTargetDescription(for program: BlastProgram) -> String {
+        let germlineParts = [
+            labeled("V", germlineVDatabase),
+            program == .igblastn ? labeled("D", germlineDDatabase) : nil,
+            program == .igblastn ? labeled("J", germlineJDatabase) : nil,
+            program == .igblastn ? labeled("C", cRegionDatabase) : nil
+        ].compactMap { $0 }
+        let germline = germlineParts.isEmpty ? "germline databases" : germlineParts.joined(separator: ", ")
+        let additional = additionalDatabaseName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !additional.isEmpty else { return germline }
+        return "\(germline) + \(additional)"
+    }
+
+    private func labeled(_ label: String, _ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return "\(label): \(trimmed)"
+    }
+}
+
 public struct BlastSearchConfiguration: Codable, Equatable, Sendable {
     public var program: BlastProgram
     public var queryText: String
@@ -711,6 +1219,7 @@ public struct BlastSearchConfiguration: Codable, Equatable, Sendable {
     public var outputPath: String
     public var optionValues: [String: String]
     public var rawArguments: String
+    public var igBlast: IgBlastConfiguration
 
     public init(
         program: BlastProgram = .blastn,
@@ -725,7 +1234,8 @@ public struct BlastSearchConfiguration: Codable, Equatable, Sendable {
         databaseDirectory: String = "",
         outputPath: String = "",
         optionValues: [String: String] = BlastParameterCatalog.defaultValues(for: .blastn),
-        rawArguments: String = ""
+        rawArguments: String = "",
+        igBlast: IgBlastConfiguration = IgBlastConfiguration()
     ) {
         self.program = program
         self.queryText = queryText
@@ -740,6 +1250,7 @@ public struct BlastSearchConfiguration: Codable, Equatable, Sendable {
         self.outputPath = outputPath
         self.optionValues = optionValues
         self.rawArguments = rawArguments
+        self.igBlast = igBlast
     }
 
     public mutating func resetOptionsForProgram() {
@@ -772,6 +1283,8 @@ public enum BlastCommandBuildError: Error, LocalizedError, Equatable {
     case missingSubject
     case missingDatabase
     case missingOutputPath
+    case missingGermlineVDatabase
+    case unsupportedPairwiseProgram(String)
     case malformedRawArguments(String)
 
     public var errorDescription: String? {
@@ -784,6 +1297,10 @@ public enum BlastCommandBuildError: Error, LocalizedError, Equatable {
             "Choose a BLAST database."
         case .missingOutputPath:
             "Choose an output file."
+        case .missingGermlineVDatabase:
+            "Choose an IgBLAST germline V database."
+        case .unsupportedPairwiseProgram(let program):
+            "\(program) does not support Align two sequences mode."
         case .malformedRawArguments(let value):
             "Could not parse advanced arguments near: \(value)"
         }
@@ -802,12 +1319,19 @@ public enum BlastCommandBuilder {
             throw BlastCommandBuildError.missingOutputPath
         }
 
+        if configuration.program.isIgBlast {
+            return try buildIgBlast(configuration: configuration, queryPath: query)
+        }
+
         var arguments = ["-query", query]
         if !configuration.querySubrange.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             arguments.append(contentsOf: ["-query_loc", configuration.querySubrange])
         }
 
         if configuration.alignTwoSequences {
+            guard configuration.program.supportsPairwiseAlignment else {
+                throw BlastCommandBuildError.unsupportedPairwiseProgram(configuration.program.displayName)
+            }
             let subject = subjectPath.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !subject.isEmpty else { throw BlastCommandBuildError.missingSubject }
             arguments.append(contentsOf: ["-subject", subject])
@@ -841,6 +1365,62 @@ public enum BlastCommandBuilder {
         )
     }
 
+    private static func buildIgBlast(
+        configuration: BlastSearchConfiguration,
+        queryPath: String
+    ) throws -> BlastCommand {
+        guard !configuration.alignTwoSequences else {
+            throw BlastCommandBuildError.unsupportedPairwiseProgram(configuration.program.displayName)
+        }
+
+        let igBlast = configuration.igBlast
+        let germlineV = igBlast.germlineVDatabase.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !germlineV.isEmpty else { throw BlastCommandBuildError.missingGermlineVDatabase }
+
+        var arguments = ["-query", queryPath]
+        if !configuration.querySubrange.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            arguments.append(contentsOf: ["-query_loc", configuration.querySubrange])
+        }
+
+        arguments.append(contentsOf: ["-germline_db_V", germlineV])
+        if configuration.program == .igblastn {
+            appendValueOption("-germline_db_D", value: igBlast.germlineDDatabase, to: &arguments)
+            appendValueOption("-germline_db_J", value: igBlast.germlineJDatabase, to: &arguments)
+            appendValueOption("-c_region_db", value: igBlast.cRegionDatabase, to: &arguments)
+        }
+        appendValueOption("-organism", value: igBlast.organism, to: &arguments)
+        appendValueOption("-ig_seqtype", value: igBlast.sequenceType, to: &arguments)
+        if configuration.program == .igblastn {
+            appendValueOption("-auxiliary_data", value: igBlast.auxiliaryDataPath, to: &arguments)
+        }
+        appendValueOption("-db", value: igBlast.additionalDatabaseName, to: &arguments)
+        arguments.append(contentsOf: ["-out", configuration.outputPath])
+
+        let options = BlastParameterCatalog.options(for: configuration.program)
+        for option in options {
+            guard let value = configuration.optionValues[option.id] else { continue }
+            arguments.append(contentsOf: option.arguments(for: value))
+        }
+
+        do {
+            arguments.append(contentsOf: try splitShellArguments(configuration.rawArguments))
+        } catch {
+            throw BlastCommandBuildError.malformedRawArguments(configuration.rawArguments)
+        }
+
+        return BlastCommand(
+            executableName: configuration.program.executableName,
+            arguments: arguments,
+            environment: igBlastEnvironment(for: configuration)
+        )
+    }
+
+    private static func appendValueOption(_ flag: String, value: String, to arguments: inout [String]) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        arguments.append(contentsOf: [flag, trimmed])
+    }
+
     private static func databaseArgument(for configuration: BlastSearchConfiguration) -> String {
         let databaseName = configuration.databaseName.trimmingCharacters(in: .whitespacesAndNewlines)
         return databaseName
@@ -852,6 +1432,21 @@ public enum BlastCommandBuilder {
         let databaseName = configuration.databaseName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !directory.isEmpty, !isPathLikeDatabaseName(databaseName) else { return [:] }
         return ["BLASTDB": directory]
+    }
+
+    private static func igBlastEnvironment(for configuration: BlastSearchConfiguration) -> [String: String] {
+        var environment: [String: String] = [:]
+        let igDataDirectory = configuration.igBlast.igDataDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !igDataDirectory.isEmpty {
+            environment["IGDATA"] = igDataDirectory
+        }
+
+        let additionalDirectory = configuration.igBlast.additionalDatabaseDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let additionalDatabaseName = configuration.igBlast.additionalDatabaseName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !additionalDirectory.isEmpty, !additionalDatabaseName.isEmpty, !isPathLikeDatabaseName(additionalDatabaseName) {
+            environment["BLASTDB"] = additionalDirectory
+        }
+        return environment
     }
 
     private static func isPathLikeDatabaseName(_ databaseName: String) -> Bool {
@@ -986,6 +1581,52 @@ public struct BlastAlignmentSection: Identifiable, Codable, Equatable, Sendable 
     }
 }
 
+public struct IgBlastDomainRegion: Identifiable, Codable, Equatable, Sendable {
+    public var name: String
+    public var qualifier: String
+    public var from: String
+    public var to: String
+    public var length: String
+    public var matches: String
+    public var mismatches: String
+    public var gaps: String
+    public var percentIdentity: String
+
+    public var id: String {
+        [name, qualifier, from, to].joined(separator: "|")
+    }
+
+    public var displayName: String {
+        qualifier.isEmpty ? name : "\(name) \(qualifier)"
+    }
+
+    public var rangeLabel: String {
+        from.isEmpty || to.isEmpty ? "" : "\(from)-\(to)"
+    }
+
+    public init(
+        name: String,
+        qualifier: String = "",
+        from: String = "",
+        to: String = "",
+        length: String = "",
+        matches: String = "",
+        mismatches: String = "",
+        gaps: String = "",
+        percentIdentity: String = ""
+    ) {
+        self.name = name
+        self.qualifier = qualifier
+        self.from = from
+        self.to = to
+        self.length = length
+        self.matches = matches
+        self.mismatches = mismatches
+        self.gaps = gaps
+        self.percentIdentity = percentIdentity
+    }
+}
+
 public struct BlastResultReport: Codable, Equatable, Sendable {
     public var format: BlastResultFormat
     public var rawText: String
@@ -999,6 +1640,7 @@ public struct BlastResultReport: Codable, Equatable, Sendable {
     public var alignments: [BlastAlignmentSection]
     public var tabularHeaders: [String]
     public var tabularRows: [[String]]
+    public var igBlastDomainRegions: [IgBlastDomainRegion]
 
     public var hitCount: Int {
         if !hits.isEmpty {
@@ -1026,7 +1668,8 @@ public struct BlastResultReport: Codable, Equatable, Sendable {
         hits: [BlastResultHit] = [],
         alignments: [BlastAlignmentSection] = [],
         tabularHeaders: [String] = [],
-        tabularRows: [[String]] = []
+        tabularRows: [[String]] = [],
+        igBlastDomainRegions: [IgBlastDomainRegion] = []
     ) {
         self.format = format
         self.rawText = rawText
@@ -1040,6 +1683,7 @@ public struct BlastResultReport: Codable, Equatable, Sendable {
         self.alignments = alignments
         self.tabularHeaders = tabularHeaders
         self.tabularRows = tabularRows
+        self.igBlastDomainRegions = igBlastDomainRegions
     }
 }
 
@@ -1052,6 +1696,7 @@ public enum BlastResultParser {
         let tabular = parseTabular(lines)
         let alignments = parseAlignmentSections(lines)
         let pairwiseHits = parsePairwiseHits(lines)
+        let igBlastDomainRegions = parseIgBlastDomainRegions(lines)
         let hits = pairwiseHits.isEmpty ? tabularHits(rows: tabular.rows, headers: tabular.headers) : pairwiseHits
         let noHits = normalizedText.range(of: "No hits found", options: .caseInsensitive) != nil
         let format: BlastResultFormat
@@ -1075,14 +1720,15 @@ public enum BlastResultParser {
             hits: hits,
             alignments: alignments,
             tabularHeaders: tabular.headers,
-            tabularRows: tabular.rows
+            tabularRows: tabular.rows,
+            igBlastDomainRegions: igBlastDomainRegions
         )
     }
 
     private static func parseProgram(_ lines: [String]) -> String {
         lines
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { $0.hasPrefix("BLAST") } ?? ""
+            .first { $0.hasPrefix("BLAST") || $0.hasPrefix("IGBLAST") || $0.hasPrefix("IgBLAST") } ?? ""
     }
 
     private static func parseQuery(_ lines: [String]) -> String {
@@ -1287,6 +1933,10 @@ public enum BlastResultParser {
             guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
             let columns = line.components(separatedBy: "\t")
             guard columns.count > 1 else { continue }
+            if fields.isEmpty, rows.isEmpty, looksLikeTabularHeader(columns) {
+                fields = columns.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                continue
+            }
             rows.append(columns)
         }
 
@@ -1299,6 +1949,61 @@ public enum BlastResultParser {
             headers = []
         }
         return (headers, rows)
+    }
+
+    private static func parseIgBlastDomainRegions(_ lines: [String]) -> [IgBlastDomainRegion] {
+        guard let startIndex = lines.firstIndex(where: {
+            $0.range(
+                of: "Alignment summary between query and top germline V gene hit",
+                options: .caseInsensitive
+            ) != nil
+        }) else {
+            return []
+        }
+
+        var regions: [IgBlastDomainRegion] = []
+        var hasStartedRows = false
+        for line in lines.dropFirst(startIndex + 1) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                if hasStartedRows { break }
+                continue
+            }
+            if trimmed.lowercased().hasPrefix("alignments") {
+                break
+            }
+
+            let tokens = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard !tokens.isEmpty else { continue }
+            guard tokens[0].range(of: #"^(FR|CDR)\d?-|^CDR3-"#, options: .regularExpression) != nil else {
+                continue
+            }
+            hasStartedRows = true
+
+            let name = tokens[0]
+            var offset = 1
+            var qualifier = ""
+            if tokens.indices.contains(offset), tokens[offset].hasPrefix("(") {
+                qualifier = tokens[offset]
+                offset += 1
+            }
+            guard tokens.count >= offset + 7 else { continue }
+
+            regions.append(
+                IgBlastDomainRegion(
+                    name: name,
+                    qualifier: qualifier,
+                    from: tokens[offset],
+                    to: tokens[offset + 1],
+                    length: tokens[offset + 2],
+                    matches: tokens[offset + 3],
+                    mismatches: tokens[offset + 4],
+                    gaps: tokens[offset + 5],
+                    percentIdentity: tokens[offset + 6]
+                )
+            )
+        }
+        return regions
     }
 
     private static func tabularHits(rows: [[String]], headers: [String]) -> [BlastResultHit] {
@@ -1318,20 +2023,37 @@ public enum BlastResultParser {
         }
 
         return rows.prefix(200).map { row in
-            let subject = value(in: row, names: ["sseqid", "subject id", "subject acc.", "subject acc"], fallbackIndex: 1)
-            let title = value(in: row, names: ["stitle", "subject title"], fallbackIndex: 1)
+            let hasAirrHeaders = normalizedHeaders.contains("sequenceid") || normalizedHeaders.contains("vcall")
+            let subjectFallbackIndex = hasAirrHeaders ? nil : 1
+            let subject = value(in: row, names: ["sseqid", "subject id", "subject acc.", "subject acc"], fallbackIndex: subjectFallbackIndex)
+            let vCall = value(in: row, names: ["v_call", "v call"])
+            let dCall = value(in: row, names: ["d_call", "d call"])
+            let jCall = value(in: row, names: ["j_call", "j call"])
+            let rearrangementTitle = [vCall, dCall, jCall].filter { !$0.isEmpty }.joined(separator: " / ")
+            let title = value(in: row, names: ["stitle", "subject title"], fallbackIndex: subjectFallbackIndex)
             let identity = value(in: row, names: ["pident", "% identity"], fallbackIndex: 2)
             let eValue = value(in: row, names: ["evalue", "e-value"], fallbackIndex: row.count >= 12 ? 10 : nil)
             let score = value(in: row, names: ["bitscore", "bit score"], fallbackIndex: row.count >= 12 ? 11 : nil)
+            let query = value(in: row, names: ["sequence_id", "sequence id", "qseqid", "query id"], fallbackIndex: 0)
             return BlastResultHit(
-                title: title.isEmpty ? subject : title,
-                accession: subject,
+                title: !rearrangementTitle.isEmpty ? rearrangementTitle : (title.isEmpty ? subject : title),
+                accession: subject.isEmpty ? query : subject,
                 scoreBits: score,
                 eValue: eValue,
                 identity: identity.isEmpty ? "" : "\(identity)%",
                 queryCover: value(in: row, names: ["qcovhsp", "query cover"])
             )
         }
+    }
+
+    private static func looksLikeTabularHeader(_ columns: [String]) -> Bool {
+        let normalized = columns.map { normalizeFieldName($0) }
+        let headerNames: Set<String> = [
+            "sequenceid", "revcomp", "productive", "vjincdr3", "vcall", "dcall", "jcall",
+            "sequencealignment", "germlinealignment", "junction", "junctionaa",
+            "qseqid", "sseqid", "pident", "evalue", "bitscore"
+        ]
+        return normalized.contains { headerNames.contains($0) }
     }
 
     private static func extractMetric(from line: String, label: String) -> String {

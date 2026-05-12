@@ -10,7 +10,8 @@ The app is intentionally local-first. It does not contact NCBI on launch, and it
 
 ## Features
 
-- Runs local `blastn`, `blastp`, `blastx`, `tblastn`, `tblastx`, `psiblast`, `rpsblast`, `rpstblastn`, and `deltablast`.
+- Runs local `blastn`, `blastp`, `blastx`, `tblastn`, `tblastx`, `psiblast`, `rpsblast`, `rpstblastn`, `deltablast`, `igblastn`, and `igblastp`.
+- Adds IgBLAST controls for immunoglobulin and T cell receptor searches, including `IGDATA`, germline V/D/J/C database prefixes, auxiliary data, optional additional database search, and AIRR TSV output.
 - Supports local database searches with downloaded BLAST databases such as `core_nt`, `nr_cluster_seq`, `nt`, `nr`, `refseq_protein`, and `refseq_rna`.
 - Supports pairwise sequence comparison with **Align two sequences**, using BLAST+'s `-subject` mode instead of a database.
 - Adds an **RNA-Seq** annotation workspace for trimmed/merged `.fq`, `.fastq`, `.fq.gz`, or `.fastq.gz` inputs, including multi-file selection, database choice, output-field selection, and staged progress.
@@ -28,13 +29,14 @@ The app is intentionally local-first. It does not contact NCBI on launch, and it
 Startup is offline. On launch the app:
 
 1. Scans your configured BLASTDB folder.
-2. Checks local BLAST+ tool paths and versions.
+2. Checks local BLAST+/IgBLAST tool paths without launching those tools.
 3. Builds the command preview locally.
 
 The app contacts NCBI only for these explicit actions:
 
 - **Refresh Catalog**: runs `update_blastdb.pl --showall` to retrieve the current list of downloadable databases.
 - **Download Selected**: runs `update_blastdb.pl` for the selected database names.
+- **Tools > Recheck**: launches local tools with version flags so their installed versions can be displayed.
 
 Normal BLAST searches run locally with your installed BLAST+ binaries. The app does not send query FASTA content to NCBI.
 
@@ -43,6 +45,7 @@ Normal BLAST searches run locally with your installed BLAST+ binaries. The app d
 - macOS 14 or newer.
 - Swift 6 toolchain to build from source.
 - NCBI BLAST+ installed locally.
+- NCBI IgBLAST installed locally when using `igblastn` or `igblastp`.
 - Perl and `curl`, which are used by NCBI's `update_blastdb.pl`.
 - Enough disk space for selected databases.
 
@@ -101,8 +104,9 @@ The DMG script builds separate `arm64` and `x86_64` release binaries, combines t
 4. The app scans installed databases immediately without contacting NCBI.
 5. Click **Refresh Catalog** only when you want to fetch the latest downloadable list from NCBI.
 6. Start with `core_nt` for BLASTN and `nr_cluster_seq` for BLASTP, or select other databases and click **Download Selected**.
-7. Open **Run BLAST**, paste or choose a FASTA query, pick a database, set options, and run.
-8. Open **Results** to review completed jobs or load saved BLAST result files.
+7. For IgBLAST, install the NCBI IgBLAST package, set the same bin directory in **Tools**, and point **Run BLAST** at the IgBLAST release support-data folder through `IGDATA`.
+8. Open **Run BLAST**, paste or choose a FASTA query, pick a database or IgBLAST germline databases, set options, and run.
+9. Open **Results** to review completed jobs or load saved BLAST result files.
 
 ## Running A Database Search
 
@@ -115,6 +119,45 @@ blastn -query query.fasta -db core_nt -out result.txt -task megablast
 ```
 
 The app sets `BLASTDB` for the BLAST process and also passes the selected database path directly.
+
+## Viewing Search Progress And Results
+
+The **Run BLAST** screen shows a live search-progress panel while a job is active. It records when the sequence is submitted, which program and database are being searched, elapsed time, output-file growth, and the parsed hit count when the job finishes.
+
+BLAST writes most report content to the selected `-out` file rather than to stdout. Local BLAST Studio reads that output file automatically after the process exits and renders the report in the GUI, including BLAST description tables, pairwise alignments, tabular rows, IgBLAST domain summaries, AIRR-style rows, and the raw report text.
+
+Pasted plain sequence text is normalized to FASTA before launch, so quick online-BLAST-style query pastes work without manually adding a `>` header.
+
+## Running IgBLAST
+
+Choose `IgBLASTN` or `IgBLASTP` in **Run BLAST** to classify immunoglobulin or T cell receptor sequences against local germline databases.
+
+IgBLAST commands use `-germline_db_V` instead of the normal required BLAST `-db` argument. For nucleotide rearrangement searches, fill in V, D, J, optional C-region, and optional auxiliary-data fields. Set `IGDATA` to the IgBLAST folder that contains `internal_data` and `optional_file`, unless your shell environment already provides it.
+
+Keep IgBLAST germline databases in a path without spaces so BLAST can memory-map the database files reliably. On the development machine for this build, the local database folder is:
+
+```sh
+/Users/home/LocalBlastStudio-IgBlastDatabases
+```
+
+The default human local fields are:
+
+```text
+IGDATA: /opt/homebrew/anaconda3/share/igblast
+V: /Users/home/LocalBlastStudio-IgBlastDatabases/airr_c_human_ig.V
+D: /Users/home/LocalBlastStudio-IgBlastDatabases/airr_c_human_igh.D
+J: /Users/home/LocalBlastStudio-IgBlastDatabases/airr_c_human_ig.J
+C: /Users/home/LocalBlastStudio-IgBlastDatabases/ncbi_human_c_genes
+Auxiliary data: /opt/homebrew/anaconda3/share/igblast/optional_file/human_gl.aux
+```
+
+The generated command is shaped like:
+
+```sh
+IGDATA=/path/to/igblast igblastn -query query.fasta -germline_db_V database/human_gl_V -germline_db_D database/human_gl_D -germline_db_J database/human_gl_J -organism human -ig_seqtype Ig -auxiliary_data optional_file/human_gl.aux -out result.tsv -outfmt 19
+```
+
+You can also supply an optional additional BLAST database; when it is a database name rather than a path, Local BLAST Studio sets `BLASTDB` from the additional database directory.
 
 ## Annotating Trimmed RNA-Seq FASTQ
 
