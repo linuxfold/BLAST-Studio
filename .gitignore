@@ -3,3 +3,9 @@ dist/
 .DS_Store
 *.xcuserdata/
 DerivedData/
+LocalBlastStudio Results/
+blast-*.txt
+alignment-*.aln
+alignment-*.clu
+rnaseq-annotations*.tsv
+*.localblaststudio.json

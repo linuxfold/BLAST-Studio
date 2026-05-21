@@ -4,7 +4,7 @@
 
 Local BLAST Studio is a native macOS app for running the NCBI BLAST+ command-line suite locally through a GUI. It wraps your installed BLAST+ binaries, scans your local BLAST database folder, manages downloads with NCBI's `update_blastdb.pl`, and keeps the generated command line visible before each run.
 
->If installing from precompiled .dmg, after dragging the app into your Aplications, type: xattr -dr com.apple.quarantine /Applications/LocalBlastStudio.app
+> If installing from a precompiled `.dmg`, drag the app into `/Applications`. If macOS quarantines the unsigned app, run: `xattr -dr com.apple.quarantine /Applications/LocalBlastStudio.app`
 
 The app is intentionally local-first. It does not contact NCBI on launch, and it does not upload query sequences. It contacts NCBI only when you explicitly click **Refresh Catalog** or **Download Selected**.
 
@@ -14,8 +14,9 @@ The app is intentionally local-first. It does not contact NCBI on launch, and it
 - Adds IgBLAST controls for immunoglobulin and T cell receptor searches, including `IGDATA`, germline V/D/J/C database prefixes, auxiliary data, optional additional database search, and AIRR TSV output.
 - Supports local database searches with downloaded BLAST databases such as `core_nt`, `nr_cluster_seq`, `nt`, `nr`, `refseq_protein`, and `refseq_rna`.
 - Supports pairwise sequence comparison with **Align two sequences**, using BLAST+'s `-subject` mode instead of a database.
+- Supports BLASTN/BLASTP **Align 3+ sequences** mode for local Clustal Omega multiple sequence alignments.
 - Adds an **RNA-Seq** annotation workspace for trimmed/merged `.fq`, `.fastq`, `.fq.gz`, or `.fastq.gz` inputs, including multi-file selection, database choice, output-field selection, and staged progress.
-- Adds a **Results** workspace that tracks multiple jobs, auto-loads saved `.txt`, `.tsv`, and `.out` reports, and renders BLAST descriptions, alignments, tabular rows, and raw output in a GUI.
+- Adds a **Results** workspace that tracks multiple jobs, auto-loads saved `.txt`, `.tsv`, `.out`, `.aln`, and `.clu` reports, renders BLAST descriptions, alignments, tabular rows, multiple alignments, and raw output in a GUI, supports shift-range selection plus export/delete actions, and can reuse saved run inputs/settings for a new search.
 - Provides website-style controls for common BLAST parameters: task, E-value, max target sequences, word size, scoring, filters, masking, output format, genetic code, ranges, and PSI-BLAST settings.
 - Provides a raw advanced-arguments field, appended last, for BLAST+ switches that are not yet represented by structured controls.
 - Discovers downloadable NCBI database names with `update_blastdb.pl --showall` when requested.
@@ -23,6 +24,17 @@ The app is intentionally local-first. It does not contact NCBI on launch, and it
 - Builds custom nucleotide or protein databases with `makeblastdb`.
 - Shows installed database count, storage use, file count, installed database badges, and catalog entries that are not installed.
 - Packages as a standard macOS `.app` bundle with a custom icon.
+
+## What's New In 0.4.0
+
+- Added BLASTN/BLASTP **Align 3+ sequences** mode backed by local Clustal Omega (`clustalo`).
+- Reworked the app shell with a top workspace bar and a persistent, resizable Results panel.
+- Added a full Results workspace that opens selected results in the main view while keeping the Results list visible.
+- Added result re-use: new runs save a local sidecar metadata file so a result can reload its original inputs/settings into **Run BLAST** with a fresh output path.
+- Added multi-result selection with shift-click range selection and command-click toggling.
+- Added selected/all result export and delete controls, plus right-click result menus.
+- Improved alignment viewing by defaulting sequence alignments to **Raw**, removing BLAST citation blocks from raw display, increasing raw text size, and anchoring alignment text at the top of the pane.
+- Updated packaging to produce `BLAST-Studio-0.4.0-universal.dmg`.
 
 ## Privacy And Network Behavior
 
@@ -44,16 +56,68 @@ Normal BLAST searches run locally with your installed BLAST+ binaries. The app d
 
 - macOS 14 or newer.
 - Swift 6 toolchain to build from source.
-- NCBI BLAST+ installed locally.
-- NCBI IgBLAST installed locally when using `igblastn` or `igblastp`.
-- Perl and `curl`, which are used by NCBI's `update_blastdb.pl`.
+- NCBI BLAST+ installed locally for normal searches, database downloads, and custom database creation.
+- NCBI IgBLAST installed locally only when using `igblastn` or `igblastp`.
+- Clustal Omega installed locally only when using **Align 3+ sequences**.
+- Perl and `curl`, used by NCBI's `update_blastdb.pl`.
 - Enough disk space for selected databases.
 
-On the development machine used for this build, BLAST+ was installed at:
+## External Tool Installation
+
+Local BLAST Studio does not bundle NCBI or Clustal binaries. Install them once, then open **Tools** in the app and either leave the tool directory blank to search `PATH`, or set it to the folder containing the executables.
+
+Required for standard BLAST searches and database downloads:
+
+- `blastn`, `blastp`, `blastx`, `tblastn`, `tblastx`
+- `psiblast`, `rpsblast`, `rpstblastn`, `deltablast`
+- `makeblastdb`, `blastdbcmd`, `update_blastdb.pl`
+- `dustmasker`, `segmasker`, `windowmasker`, `makeprofiledb`, `makembindex`, `convert2blastmask`
+- `perl`, `curl`, and `gzip`
+
+Required only for IgBLAST:
+
+- `igblastn`, `igblastp`
+- IgBLAST support data containing `internal_data` and `optional_file`
+- Local germline V/D/J/C database prefixes formatted for IgBLAST
+
+Required only for **Align 3+ sequences**:
+
+- `clustalo`
+
+Fastest macOS install path for BLAST+ and Clustal Omega with Homebrew:
 
 ```sh
-/opt/homebrew/anaconda3/bin
+brew install blast clustal-omega
 ```
+
+Fastest single-environment install path for BLAST+, IgBLAST, and Clustal Omega with Conda/Bioconda:
+
+```sh
+conda create -n local-blast-studio -c conda-forge -c bioconda blast igblast clustalo
+conda activate local-blast-studio
+```
+
+After a Homebrew install, the tool directory is usually `/opt/homebrew/bin` on Apple Silicon or `/usr/local/bin` on Intel Macs. After a Conda install, use:
+
+```sh
+echo "$CONDA_PREFIX/bin"
+```
+
+Verify the installed tools from Terminal:
+
+```sh
+blastn -version
+makeblastdb -version
+update_blastdb.pl --showall
+clustalo --version
+igblastn -version
+```
+
+Official alternatives:
+
+- Install BLAST+ directly from [NCBI](https://www.ncbi.nlm.nih.gov/books/NBK569861/) if you prefer NCBI's macOS installer or tarball.
+- Install stand-alone IgBLAST from [NCBI IgBLAST](https://www.ncbi.nlm.nih.gov/igblast/) if you do not use Bioconda.
+- Install Clustal Omega through [Bioconda `clustalo`](https://bioconda.github.io/recipes/clustalo/README.html) if Homebrew is not available on the target machine.
 
 ## Build And Run
 
@@ -91,15 +155,15 @@ Create a universal Intel + Apple Silicon DMG:
 The DMG is created at:
 
 ```sh
-dist/BLAST-Studio-0.3.0-universal.dmg
+dist/BLAST-Studio-0.4.0-universal.dmg
 ```
 
 The DMG script builds separate `arm64` and `x86_64` release binaries, combines them with `lipo`, creates a drag-to-Applications disk image, and ad-hoc signs the app by default. It is not notarized. To sign with a Developer ID certificate, run it with `CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./scripts/package_dmg.sh`.
 
 ## First Launch
 
-1. Open **Tools** and confirm BLAST+ tools are detected.
-2. If needed, set the BLAST+ bin directory, for example `/opt/homebrew/anaconda3/bin`.
+1. Open **Tools** and confirm BLAST+, IgBLAST, and Clustal Omega tools are detected as needed for your workflow.
+2. If needed, set the tool bin directory, for example `/opt/homebrew/bin`, `/usr/local/bin`, or the active Conda environment's `bin` directory.
 3. Open **Databases** and choose a BLASTDB directory.
 4. The app scans installed databases immediately without contacting NCBI.
 5. Click **Refresh Catalog** only when you want to fetch the latest downloadable list from NCBI.
@@ -110,7 +174,7 @@ The DMG script builds separate `arm64` and `x86_64` release binaries, combines t
 
 ## Running A Database Search
 
-For a normal search, leave **Align two sequences** unchecked.
+For a normal search, leave **Align two sequences** and **Align 3+ sequences** unchecked.
 
 The app generates a command shaped like:
 
@@ -134,21 +198,21 @@ Choose `IgBLASTN` or `IgBLASTP` in **Run BLAST** to classify immunoglobulin or T
 
 IgBLAST commands use `-germline_db_V` instead of the normal required BLAST `-db` argument. For nucleotide rearrangement searches, fill in V, D, J, optional C-region, and optional auxiliary-data fields. Set `IGDATA` to the IgBLAST folder that contains `internal_data` and `optional_file`, unless your shell environment already provides it.
 
-Keep IgBLAST germline databases in a path without spaces so BLAST can memory-map the database files reliably. On the development machine for this build, the local database folder is:
+Keep IgBLAST germline databases in a path without spaces so BLAST can memory-map the database files reliably. A typical local database folder is:
 
 ```sh
-/Users/home/LocalBlastStudio-IgBlastDatabases
+~/LocalBlastStudio-IgBlastDatabases
 ```
 
-The default human local fields are:
+Example human local fields are:
 
 ```text
-IGDATA: /opt/homebrew/anaconda3/share/igblast
-V: /Users/home/LocalBlastStudio-IgBlastDatabases/airr_c_human_ig.V
-D: /Users/home/LocalBlastStudio-IgBlastDatabases/airr_c_human_igh.D
-J: /Users/home/LocalBlastStudio-IgBlastDatabases/airr_c_human_ig.J
-C: /Users/home/LocalBlastStudio-IgBlastDatabases/ncbi_human_c_genes
-Auxiliary data: /opt/homebrew/anaconda3/share/igblast/optional_file/human_gl.aux
+IGDATA: /path/to/igblast
+V: ~/LocalBlastStudio-IgBlastDatabases/airr_c_human_ig.V
+D: ~/LocalBlastStudio-IgBlastDatabases/airr_c_human_igh.D
+J: ~/LocalBlastStudio-IgBlastDatabases/airr_c_human_ig.J
+C: ~/LocalBlastStudio-IgBlastDatabases/ncbi_human_c_genes
+Auxiliary data: /path/to/igblast/optional_file/human_gl.aux
 ```
 
 The generated command is shaped like:
@@ -235,6 +299,22 @@ This mode uses `-subject` instead of `-db`, for example:
 
 ```sh
 blastp -query query.faa -subject subject.faa -out pairwise.txt
+```
+
+## Aligning Three Or More Sequences
+
+To run a local multiple sequence alignment:
+
+1. Open **Run BLAST**.
+2. Choose `BLASTN` for DNA or `BLASTP` for protein.
+3. Paste or choose a FASTA file containing at least three records.
+4. Check **Align 3+ sequences**.
+5. Run the alignment.
+
+This mode uses Clustal Omega through `clustalo`, for example:
+
+```sh
+clustalo -i sequences.fasta -o alignment.aln --force --outfmt=clu --seqtype=DNA
 ```
 
 ## How Downloads Work

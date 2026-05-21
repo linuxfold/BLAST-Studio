@@ -32,6 +32,8 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
     case databases = "Databases"
     case tools = "Tools"
 
+    static let topBarSections: [WorkspaceSection] = [.run, .results, .rnaSeq, .databases, .tools]
+
     var id: String { rawValue }
 
     var systemImage: String {
@@ -90,8 +92,9 @@ struct ToolStatus: Identifiable, Hashable {
     var id: String { name }
 }
 
-enum BlastJobKind: String, Hashable {
+enum BlastJobKind: String, Codable, Hashable, Sendable {
     case blastSearch = "BLAST Search"
+    case multipleAlignment = "Multiple Alignment"
     case rnaSeq = "RNA-Seq"
     case imported = "Imported Result"
 }
@@ -121,10 +124,32 @@ struct BlastJobRecord: Identifiable, Hashable {
     var noHits = false
     var linkedGroup: String = ""
     var reservedThreads: Int = 1
+    var reusableConfiguration: BlastSearchConfiguration?
 
     var displayTitle: String {
         title.isEmpty ? URL(fileURLWithPath: outputPath).lastPathComponent : title
     }
+
+    static func == (lhs: BlastJobRecord, rhs: BlastJobRecord) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+}
+
+private struct BlastRunReuseMetadata: Codable, Sendable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion = currentSchemaVersion
+    var kind: BlastJobKind
+    var title: String
+    var program: BlastProgram
+    var database: String
+    var commandPreview: String
+    var date: Date
+    var configuration: BlastSearchConfiguration
 }
 
 enum RNASeqOutputField: String, CaseIterable, Codable, Hashable, Identifiable, Sendable {
@@ -496,13 +521,16 @@ enum LocalBlastError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .toolMissing(let tool):
-            "Could not find \(tool). Set the BLAST+/IgBLAST bin directory in Tools."
+            if tool == MultipleSequenceAlignmentCommandBuilder.executableName {
+                return "Could not find Clustal Omega (clustalo). Install Clustal Omega, then set the tool binary directory in Tools to the folder containing clustalo or make sure it is on PATH."
+            }
+            return "Could not find \(tool). Set the tool binary directory in Tools."
         case .cannotCreateDirectory(let path):
-            "Could not create directory: \(path)"
+            return "Could not create directory: \(path)"
         case .emptyDownloadSelection:
-            "Select at least one database to download."
+            return "Select at least one database to download."
         case .processFailed(let message):
-            message
+            return message
         }
     }
 }
@@ -607,7 +635,7 @@ enum ProcessClient {
     static let searchTools = BlastProgram.allCases.map(\.executableName)
     static let utilityTools = [
         "makeblastdb", "blastdbcmd", "update_blastdb.pl", "dustmasker", "segmasker",
-        "windowmasker", "makeprofiledb", "makembindex", "convert2blastmask", "gzip"
+        "windowmasker", "makeprofiledb", "makembindex", "convert2blastmask", "gzip", "clustalo"
     ]
 
     static func resolveExecutable(named name: String, preferences: BlastPreferences) -> URL? {
@@ -1000,6 +1028,7 @@ final class AppModel: ObservableObject {
     @Published var toolStatuses: [ToolStatus] = []
     @Published var jobs: [BlastJobRecord] = []
     @Published var selectedJobID: BlastJobRecord.ID?
+    @Published var selectedJobIDs: Set<BlastJobRecord.ID> = []
     @Published var selectedResultReport: BlastResultReport?
     @Published var resultLog = ""
     @Published var customDatabaseInput = ""
@@ -1019,9 +1048,26 @@ final class AppModel: ObservableObject {
     private var runningJobHandles: [BlastJobRecord.ID: TrackedProcessHandle] = [:]
     private var runningJobThreads: [BlastJobRecord.ID: Int] = [:]
     private var killedJobIDs: Set<BlastJobRecord.ID> = []
+    private var resultSelectionAnchorID: BlastJobRecord.ID?
     private var rnaSeqProgressTask: Task<Void, Never>?
-    private let automaticResultExtensions: Set<String> = ["txt", "tsv", "out"]
+    private let automaticResultExtensions: Set<String> = ["txt", "tsv", "out", "aln", "clu"]
     private let maxAutoLoadedResultBytes: Int64 = 100 * 1_024 * 1_024
+
+    var selectedResultCount: Int {
+        selectedResultIDsForAction.count
+    }
+
+    private var selectedResultIDsForAction: Set<BlastJobRecord.ID> {
+        let liveIDs = Set(jobs.map(\.id))
+        let liveSelection = selectedJobIDs.intersection(liveIDs)
+        if !liveSelection.isEmpty {
+            return liveSelection
+        }
+        if let selectedJobID, liveIDs.contains(selectedJobID) {
+            return [selectedJobID]
+        }
+        return []
+    }
 
     init() {
         let preferences = BlastPreferences.load()
@@ -1071,7 +1117,7 @@ final class AppModel: ObservableObject {
 
     func ensureDefaultOutputPath() {
         if configuration.outputPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            configuration.outputPath = defaultBlastOutputPath(for: configuration.program)
+            configuration.outputPath = defaultSearchOutputPath(for: configuration)
         }
     }
 
@@ -1163,22 +1209,70 @@ final class AppModel: ObservableObject {
             .path
     }
 
+    private func defaultSearchOutputPath(for configuration: BlastSearchConfiguration, date: Date = Date()) -> String {
+        guard configuration.alignMultipleSequences else {
+            return defaultBlastOutputPath(for: configuration.program, date: date)
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let filename = "alignment-\(configuration.program.rawValue)-\(formatter.string(from: date)).aln"
+        return URL(fileURLWithPath: preferences.outputDirectory)
+            .appendingPathComponent(filename)
+            .path
+    }
+
+    private func reusableOutputPath(for configuration: BlastSearchConfiguration) -> String {
+        uniqueOutputPath(defaultSearchOutputPath(for: configuration))
+    }
+
     func setProgram(_ program: BlastProgram) {
         configuration.program = program
         configuration.resetOptionsForProgram()
         if program.isIgBlast {
             configuration.alignTwoSequences = false
+            configuration.alignMultipleSequences = false
             if configuration.igBlast.additionalDatabaseDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 configuration.igBlast.additionalDatabaseDirectory = preferences.databaseDirectory
             }
-        } else if let recommendedDatabaseName = program.recommendedDatabaseName {
-            configuration.databaseName = recommendedDatabaseName
-        } else if let matchingDatabase = databaseCatalog.first(where: { $0.kind == program.databaseKind && $0.isInstalled }) ??
-            databaseCatalog.first(where: { $0.kind == program.databaseKind }) {
-            configuration.databaseName = matchingDatabase.name
+        } else {
+            if !program.supportsMultipleSequenceAlignment {
+                configuration.alignMultipleSequences = false
+            }
+            if let recommendedDatabaseName = program.recommendedDatabaseName {
+                configuration.databaseName = recommendedDatabaseName
+            } else if let matchingDatabase = databaseCatalog.first(where: { $0.kind == program.databaseKind && $0.isInstalled }) ??
+                databaseCatalog.first(where: { $0.kind == program.databaseKind }) {
+                configuration.databaseName = matchingDatabase.name
+            } else {
+                configuration.databaseName = ""
+            }
         }
         refreshStructureQueryTextForSelectedProgram()
         ensureDefaultOutputPath()
+        updateCommandPreview()
+    }
+
+    func setPairwiseAlignmentEnabled(_ isEnabled: Bool) {
+        configuration.alignTwoSequences = isEnabled
+        if isEnabled {
+            configuration.alignMultipleSequences = false
+        }
+        updateCommandPreview()
+    }
+
+    func setMultipleSequenceAlignmentEnabled(_ isEnabled: Bool) {
+        guard !isEnabled || configuration.program.supportsMultipleSequenceAlignment else {
+            configuration.alignMultipleSequences = false
+            return
+        }
+        configuration.alignMultipleSequences = isEnabled
+        if isEnabled {
+            configuration.alignTwoSequences = false
+            if configuration.outputPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                URL(fileURLWithPath: configuration.outputPath).pathExtension.lowercased() == "txt" {
+                configuration.outputPath = defaultSearchOutputPath(for: configuration)
+            }
+        }
         updateCommandPreview()
     }
 
@@ -1209,6 +1303,9 @@ final class AppModel: ObservableObject {
     }
 
     private func reservedThreadCount(for configuration: BlastSearchConfiguration) -> Int {
+        if configuration.alignMultipleSequences {
+            return 1
+        }
         let rawValue = configuration.optionValues["numThreads"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let requested = Int(rawValue).map { max($0, 1) } ?? 1
         return min(requested, logicalSearchThreadCount)
@@ -1282,7 +1379,7 @@ final class AppModel: ObservableObject {
     }
 
     func updateCommandPreview() {
-        if supportsStructureQueryImport, !structureChains.isEmpty {
+        if supportsStructureQueryImport, !structureChains.isEmpty, !configuration.alignMultipleSequences {
             switch configuration.program {
             case .igblastp:
                 let chains = igBlastPStructureChains()
@@ -1304,11 +1401,18 @@ final class AppModel: ObservableObject {
         let queryPath = configuration.queryFilePath.isEmpty ? "<pasted-query.fasta>" : configuration.queryFilePath
         let subjectPath = configuration.subjectFilePath.isEmpty ? "<subject.fasta>" : configuration.subjectFilePath
         do {
-            commandPreview = try BlastCommandBuilder.build(
-                configuration: configuration,
-                queryPath: queryPath,
-                subjectPath: subjectPath
-            ).preview
+            if configuration.alignMultipleSequences {
+                commandPreview = try MultipleSequenceAlignmentCommandBuilder.build(
+                    configuration: configuration,
+                    inputPath: queryPath
+                ).preview
+            } else {
+                commandPreview = try BlastCommandBuilder.build(
+                    configuration: configuration,
+                    queryPath: queryPath,
+                    subjectPath: subjectPath
+                ).preview
+            }
         } catch {
             commandPreview = error.localizedDescription
         }
@@ -1402,9 +1506,12 @@ final class AppModel: ObservableObject {
             let version: String
             if checkVersions {
                 version = await Task.detached {
-                    (try? ProcessClient.runSync(executableURL: url, arguments: ["-version"]).output)
-                        ?? (try? ProcessClient.runSync(executableURL: url, arguments: ["--version"]).output)
-                        ?? ""
+                    if let result = try? ProcessClient.runSync(executableURL: url, arguments: ["-version"]),
+                       result.exitCode == 0,
+                       !result.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        return result.output
+                    }
+                    return (try? ProcessClient.runSync(executableURL: url, arguments: ["--version"]).output) ?? ""
                 }.value
             } else {
                 version = "Version check deferred"
@@ -2096,6 +2203,14 @@ final class AppModel: ObservableObject {
         return resolvedPath
     }
 
+    private func preparedOutputPath(_ requestedPath: String, configuration: BlastSearchConfiguration) throws -> String {
+        let trimmed = requestedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let basePath = trimmed.isEmpty ? defaultSearchOutputPath(for: configuration) : trimmed
+        let resolvedPath = uniqueOutputPath(basePath)
+        try createOutputDirectory(for: resolvedPath)
+        return resolvedPath
+    }
+
     private func uniqueOutputPath(_ path: String) -> String {
         guard outputPathIsAvailable(path) else {
             return uniqueStampedOutputPath(path)
@@ -2159,22 +2274,24 @@ final class AppModel: ObservableObject {
 
             let outputBytes = Int64(resourceValues?.fileSize ?? 0)
             let report = outputBytes <= maxAutoLoadedResultBytes ? readResultReport(at: url.path) : nil
-            let program = Self.program(from: report?.program) ?? .blastn
+            let metadata = loadReuseMetadata(forOutputPath: url.path)
+            let program = metadata?.program ?? Self.program(from: report?.program) ?? .blastn
             jobs.append(
                 BlastJobRecord(
-                    kind: .imported,
-                    title: report?.query.isEmpty == false ? report?.query ?? "" : url.lastPathComponent,
+                    kind: metadata?.kind ?? .imported,
+                    title: metadata?.title.isEmpty == false ? metadata?.title ?? "" : (report?.query.isEmpty == false ? report?.query ?? "" : url.lastPathComponent),
                     program: program,
-                    database: report?.database ?? "",
+                    database: metadata?.database ?? report?.database ?? "",
                     outputPath: url.path,
-                    commandPreview: "",
+                    commandPreview: metadata?.commandPreview ?? "",
                     exitCode: nil,
-                    date: resourceValues?.contentModificationDate ?? Date(),
+                    date: metadata?.date ?? resourceValues?.contentModificationDate ?? Date(),
                     status: .imported,
                     duration: nil,
                     outputBytes: outputBytes,
                     hitCount: report?.hitCount,
-                    noHits: report?.noHits ?? false
+                    noHits: report?.noHits ?? false,
+                    reusableConfiguration: metadata?.configuration
                 )
             )
             importedCount += 1
@@ -2196,21 +2313,23 @@ final class AppModel: ObservableObject {
         let url = URL(fileURLWithPath: path)
         let outputBytes = fileSize(path: path)
         let report = outputBytes <= maxAutoLoadedResultBytes ? readResultReport(at: path) : nil
-        let program = Self.program(from: report?.program) ?? .blastn
+        let metadata = loadReuseMetadata(forOutputPath: path)
+        let program = metadata?.program ?? Self.program(from: report?.program) ?? .blastn
         let job = BlastJobRecord(
-            kind: .imported,
-            title: report?.query.isEmpty == false ? report?.query ?? "" : url.lastPathComponent,
+            kind: metadata?.kind ?? .imported,
+            title: metadata?.title.isEmpty == false ? metadata?.title ?? "" : (report?.query.isEmpty == false ? report?.query ?? "" : url.lastPathComponent),
             program: program,
-            database: report?.database ?? "",
+            database: metadata?.database ?? report?.database ?? "",
             outputPath: path,
-            commandPreview: "",
+            commandPreview: metadata?.commandPreview ?? "",
             exitCode: nil,
-            date: Self.fileModificationDate(path: path) ?? Date(),
+            date: metadata?.date ?? Self.fileModificationDate(path: path) ?? Date(),
             status: .imported,
             duration: nil,
             outputBytes: outputBytes,
             hitCount: report?.hitCount,
-            noHits: report?.noHits ?? false
+            noHits: report?.noHits ?? false,
+            reusableConfiguration: metadata?.configuration
         )
 
         if let existingIndex = jobs.firstIndex(where: { $0.outputPath == path }) {
@@ -2222,9 +2341,231 @@ final class AppModel: ObservableObject {
         resultLog = "Loaded \(url.lastPathComponent)."
     }
 
-    func selectJob(_ job: BlastJobRecord) {
+    func selectJob(_ job: BlastJobRecord, extendingRange: Bool = false, togglingSelection: Bool = false) {
+        if extendingRange,
+           let anchorID = resultSelectionAnchorID ?? selectedJobID,
+           let anchorIndex = jobs.firstIndex(where: { $0.id == anchorID }),
+           let targetIndex = jobs.firstIndex(where: { $0.id == job.id }) {
+            let bounds = min(anchorIndex, targetIndex)...max(anchorIndex, targetIndex)
+            selectedJobIDs = Set(jobs[bounds].map(\.id))
+            resultSelectionAnchorID = anchorID
+        } else if togglingSelection {
+            if selectedJobIDs.contains(job.id), selectedJobIDs.count > 1 {
+                selectedJobIDs.remove(job.id)
+                if selectedJobID == job.id,
+                   let nextID = selectedJobIDs.first,
+                   let nextJob = jobs.first(where: { $0.id == nextID }) {
+                    selectedJobID = nextJob.id
+                    loadResult(for: nextJob)
+                    return
+                }
+            } else {
+                selectedJobIDs.insert(job.id)
+                if resultSelectionAnchorID == nil {
+                    resultSelectionAnchorID = job.id
+                }
+            }
+        } else {
+            selectedJobIDs = [job.id]
+            resultSelectionAnchorID = job.id
+        }
         selectedJobID = job.id
         loadResult(for: job)
+    }
+
+    func reuseResult(_ job: BlastJobRecord) {
+        guard var reusableConfiguration = job.reusableConfiguration else {
+            resultLog = "This result does not include saved inputs and settings for reuse."
+            return
+        }
+
+        if reusableConfiguration.databaseDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            reusableConfiguration.databaseDirectory = preferences.databaseDirectory
+        }
+        if reusableConfiguration.igBlast.additionalDatabaseDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            reusableConfiguration.igBlast.additionalDatabaseDirectory = preferences.databaseDirectory
+        }
+        if reusableConfiguration.alignMultipleSequences, !reusableConfiguration.program.supportsMultipleSequenceAlignment {
+            reusableConfiguration.alignMultipleSequences = false
+        }
+
+        reusableConfiguration.outputPath = reusableOutputPath(for: reusableConfiguration)
+        configuration = reusableConfiguration
+        section = .run
+        runLog = "Loaded settings from \(URL(fileURLWithPath: job.outputPath).lastPathComponent) for a new search."
+        resultLog = "Ready to re-run \(job.displayTitle) as a new search."
+        updateCommandPreview()
+    }
+
+    func deleteSelectedResults() {
+        deleteResults(ids: selectedResultIDsForAction)
+    }
+
+    func deleteResult(_ job: BlastJobRecord) {
+        deleteResults(ids: [job.id])
+    }
+
+    func deleteAllResults() {
+        deleteResults(ids: Set(jobs.map(\.id)))
+    }
+
+    func exportSelectedResults(to directoryPath: String) {
+        exportResults(ids: selectedResultIDsForAction, to: directoryPath)
+    }
+
+    func exportResult(_ job: BlastJobRecord, to directoryPath: String) {
+        exportResults(ids: [job.id], to: directoryPath)
+    }
+
+    func exportAllResults(to directoryPath: String) {
+        exportResults(ids: Set(jobs.map(\.id)), to: directoryPath)
+    }
+
+    private func deleteResults(ids: Set<BlastJobRecord.ID>) {
+        let candidates = jobs.filter { ids.contains($0.id) }
+        guard !candidates.isEmpty else {
+            resultLog = "No results selected."
+            return
+        }
+
+        let deletableJobs = candidates.filter { !isJobRunning($0.id) }
+        guard !deletableJobs.isEmpty else {
+            resultLog = "Running results cannot be deleted until they finish or are killed."
+            return
+        }
+
+        var deletedIDs = Set<BlastJobRecord.ID>()
+        var failures: [String] = []
+        for job in deletableJobs {
+            do {
+                try deleteResultFiles(for: job)
+                deletedIDs.insert(job.id)
+            } catch {
+                failures.append("\(URL(fileURLWithPath: job.outputPath).lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+
+        if !deletedIDs.isEmpty {
+            jobs.removeAll { deletedIDs.contains($0.id) }
+            selectedJobIDs.subtract(deletedIDs)
+            if let selectedJobID, deletedIDs.contains(selectedJobID) {
+                selectFallbackResultAfterDeletion()
+            } else if selectedJobIDs.isEmpty, let selectedJobID {
+                selectedJobIDs = [selectedJobID]
+            }
+        }
+
+        let skipped = candidates.count - deletableJobs.count
+        var message = "Deleted \(deletedIDs.count.formatted()) result\(deletedIDs.count == 1 ? "" : "s")."
+        if skipped > 0 {
+            message += " Skipped \(skipped.formatted()) running result\(skipped == 1 ? "" : "s")."
+        }
+        if !failures.isEmpty {
+            message += " \(failures.count.formatted()) file\(failures.count == 1 ? "" : "s") could not be deleted."
+        }
+        resultLog = message
+    }
+
+    private func selectFallbackResultAfterDeletion() {
+        if let firstSelectedID = selectedJobIDs.first,
+           let selectedJob = jobs.first(where: { $0.id == firstSelectedID }) {
+            selectedJobID = selectedJob.id
+            loadResult(for: selectedJob)
+            return
+        }
+
+        if let firstJob = jobs.first {
+            selectedJobIDs = [firstJob.id]
+            resultSelectionAnchorID = firstJob.id
+            selectedJobID = firstJob.id
+            loadResult(for: firstJob)
+        } else {
+            selectedJobIDs = []
+            resultSelectionAnchorID = nil
+            selectedJobID = nil
+            selectedResultReport = nil
+        }
+    }
+
+    private func deleteResultFiles(for job: BlastJobRecord) throws {
+        try trashOrRemoveFileIfPresent(at: job.outputPath)
+        try? trashOrRemoveFileIfPresent(at: reuseMetadataPath(forOutputPath: job.outputPath))
+    }
+
+    private func trashOrRemoveFileIfPresent(at path: String) throws {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        let url = URL(fileURLWithPath: path)
+        do {
+            _ = try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        } catch {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func exportResults(ids: Set<BlastJobRecord.ID>, to directoryPath: String) {
+        let selectedJobs = jobs.filter { ids.contains($0.id) }
+        guard !selectedJobs.isEmpty else {
+            resultLog = "No results selected for export."
+            return
+        }
+
+        let directoryURL = URL(fileURLWithPath: directoryPath, isDirectory: true)
+        var exportedCount = 0
+        var failures: [String] = []
+
+        for job in selectedJobs {
+            let sourceURL = URL(fileURLWithPath: job.outputPath)
+            guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+                failures.append("\(sourceURL.lastPathComponent): file not found")
+                continue
+            }
+
+            do {
+                let destinationURL = availableExportURL(for: sourceURL, in: directoryURL)
+                try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+                let metadataPath = reuseMetadataPath(forOutputPath: job.outputPath)
+                if FileManager.default.fileExists(atPath: metadataPath) {
+                    try? FileManager.default.copyItem(
+                        at: URL(fileURLWithPath: metadataPath),
+                        to: URL(fileURLWithPath: reuseMetadataPath(forOutputPath: destinationURL.path))
+                    )
+                }
+                exportedCount += 1
+            } catch {
+                failures.append("\(sourceURL.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+
+        var message = "Exported \(exportedCount.formatted()) result\(exportedCount == 1 ? "" : "s") to \(directoryPath)."
+        if !failures.isEmpty {
+            message += " \(failures.count.formatted()) result\(failures.count == 1 ? "" : "s") could not be exported."
+        }
+        resultLog = message
+    }
+
+    private func availableExportURL(for sourceURL: URL, in directoryURL: URL) -> URL {
+        let fileManager = FileManager.default
+        let baseName = sourceURL.deletingPathExtension().lastPathComponent
+        let fileExtension = sourceURL.pathExtension
+        let original = directoryURL.appendingPathComponent(sourceURL.lastPathComponent)
+        if !fileManager.fileExists(atPath: original.path) {
+            return original
+        }
+
+        for index in 2..<10_000 {
+            let candidateName = fileExtension.isEmpty
+                ? "\(baseName)-\(index)"
+                : "\(baseName)-\(index).\(fileExtension)"
+            let candidate = directoryURL.appendingPathComponent(candidateName)
+            if !fileManager.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+
+        let fallbackName = fileExtension.isEmpty
+            ? "\(baseName)-\(UUID().uuidString)"
+            : "\(baseName)-\(UUID().uuidString).\(fileExtension)"
+        return directoryURL.appendingPathComponent(fallbackName)
     }
 
     func loadSelectedJobResult() {
@@ -2279,6 +2620,45 @@ final class AppModel: ObservableObject {
             return nil
         }
         return BlastResultParser.parse(text)
+    }
+
+    private func reuseMetadataPath(forOutputPath outputPath: String) -> String {
+        "\(outputPath).localblaststudio.json"
+    }
+
+    private func loadReuseMetadata(forOutputPath outputPath: String) -> BlastRunReuseMetadata? {
+        let path = reuseMetadataPath(forOutputPath: outputPath)
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(BlastRunReuseMetadata.self, from: data)
+    }
+
+    private func saveReuseMetadata(
+        kind: BlastJobKind,
+        title: String,
+        program: BlastProgram,
+        database: String,
+        outputPath: String,
+        commandPreview: String,
+        date: Date,
+        configuration: BlastSearchConfiguration
+    ) {
+        let metadata = BlastRunReuseMetadata(
+            kind: kind,
+            title: title,
+            program: program,
+            database: database,
+            commandPreview: commandPreview,
+            date: date,
+            configuration: configuration
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(metadata) else {
+            return
+        }
+        try? data.write(to: URL(fileURLWithPath: reuseMetadataPath(forOutputPath: outputPath)), options: .atomic)
     }
 
     private func updateJob(_ id: BlastJobRecord.ID, _ mutation: (inout BlastJobRecord) -> Void) {
@@ -2347,10 +2727,16 @@ final class AppModel: ObservableObject {
         if !configuration.queryFilePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return URL(fileURLWithPath: queryPath).deletingPathExtension().lastPathComponent
         }
+        if configuration.alignMultipleSequences {
+            return "\(configuration.program.queryKind.rawValue) Multiple Alignment"
+        }
         return "\(configuration.program.queryKind.rawValue) Sequence"
     }
 
     private func searchTargetDescription(for configuration: BlastSearchConfiguration) -> String {
+        if configuration.alignMultipleSequences {
+            return "3+ sequence alignment"
+        }
         if configuration.program.isIgBlast {
             return configuration.igBlast.searchTargetDescription(for: configuration.program)
         }
@@ -2366,12 +2752,15 @@ final class AppModel: ObservableObject {
     }
 
     func runSearch() async {
-        guard let executable = ProcessClient.resolveExecutable(named: configuration.program.executableName, preferences: preferences) else {
-            runLog = LocalBlastError.toolMissing(configuration.program.executableName).localizedDescription
+        let executableName = configuration.alignMultipleSequences
+            ? MultipleSequenceAlignmentCommandBuilder.executableName
+            : configuration.program.executableName
+        guard let executable = ProcessClient.resolveExecutable(named: executableName, preferences: preferences) else {
+            runLog = LocalBlastError.toolMissing(executableName).localizedDescription
             return
         }
 
-        if supportsStructureQueryImport, !structureChains.isEmpty {
+        if supportsStructureQueryImport, !structureChains.isEmpty, !configuration.alignMultipleSequences {
             await runStructureSearch(executable: executable)
             return
         }
@@ -2397,30 +2786,54 @@ final class AppModel: ObservableObject {
                 filenamePrefix: "query",
                 missingError: .missingQuery
             )
-            let subjectPath = activeConfiguration.alignTwoSequences ? try materializedSequencePath(
+            let subjectPath = activeConfiguration.alignTwoSequences && !activeConfiguration.alignMultipleSequences ? try materializedSequencePath(
                 filePath: activeConfiguration.subjectFilePath,
                 sequenceText: activeConfiguration.subjectText,
                 filenamePrefix: "subject",
                 missingError: .missingSubject
             ) : ""
+            if activeConfiguration.alignMultipleSequences {
+                let sequenceCount = fastaRecordCount(filePath: queryPath)
+                guard sequenceCount >= 3 else {
+                    throw BlastCommandBuildError.missingMultipleSequences
+                }
+            }
             let queryLength = sequenceResidueCount(filePath: queryPath)
-            outputPath = try preparedOutputPath(outputPath, program: activeConfiguration.program)
+            outputPath = try preparedOutputPath(outputPath, configuration: activeConfiguration)
             activeConfiguration.outputPath = outputPath
             configuration.outputPath = outputPath
-            let command = try BlastCommandBuilder.build(
-                configuration: activeConfiguration,
-                queryPath: queryPath,
-                subjectPath: subjectPath
+            let command = activeConfiguration.alignMultipleSequences
+                ? try MultipleSequenceAlignmentCommandBuilder.build(
+                    configuration: activeConfiguration,
+                    inputPath: queryPath
+                )
+                : try BlastCommandBuilder.build(
+                    configuration: activeConfiguration,
+                    queryPath: queryPath,
+                    subjectPath: subjectPath
+                )
+            let jobKind: BlastJobKind = activeConfiguration.alignMultipleSequences ? .multipleAlignment : .blastSearch
+            let jobTitle = jobTitle(configuration: activeConfiguration, queryPath: queryPath)
+            let jobDatabase = searchTargetDescription(for: activeConfiguration)
+            saveReuseMetadata(
+                kind: jobKind,
+                title: jobTitle,
+                program: activeConfiguration.program,
+                database: jobDatabase,
+                outputPath: outputPath,
+                commandPreview: command.preview,
+                date: startedAt,
+                configuration: activeConfiguration
             )
             let jobID = UUID()
             activeJobID = jobID
             jobs.insert(
                 BlastJobRecord(
                     id: jobID,
-                    kind: .blastSearch,
-                    title: jobTitle(configuration: activeConfiguration, queryPath: queryPath),
+                    kind: jobKind,
+                    title: jobTitle,
                     program: activeConfiguration.program,
-                    database: searchTargetDescription(for: activeConfiguration),
+                    database: jobDatabase,
                     outputPath: outputPath,
                     commandPreview: command.preview,
                     exitCode: nil,
@@ -2431,7 +2844,8 @@ final class AppModel: ObservableObject {
                     hitCount: nil,
                     noHits: false,
                     linkedGroup: "",
-                    reservedThreads: reservedThreads
+                    reservedThreads: reservedThreads,
+                    reusableConfiguration: activeConfiguration
                 ),
                 at: 0
             )
@@ -2448,7 +2862,12 @@ final class AppModel: ObservableObject {
                 queryLength: queryLength,
                 outputPath: outputPath
             )
-            startSearchOutputMonitor(jobID: jobID, outputPath: outputPath)
+            startSearchOutputMonitor(
+                jobID: jobID,
+                outputPath: outputPath,
+                activeStatus: activeConfiguration.alignMultipleSequences ? "Aligning sequences" : "Searching database",
+                writingStatus: activeConfiguration.alignMultipleSequences ? "Writing alignment" : "Writing BLAST report"
+            )
             let result = try await runTrackedProcess(
                 jobID: jobID,
                 reservedThreads: reservedThreads,
@@ -2724,12 +3143,17 @@ final class AppModel: ObservableObject {
         )
     }
 
-    private func startSearchOutputMonitor(jobID: BlastJobRecord.ID, outputPath: String) {
+    private func startSearchOutputMonitor(
+        jobID: BlastJobRecord.ID,
+        outputPath: String,
+        activeStatus: String = "Searching database",
+        writingStatus: String = "Writing BLAST report"
+    ) {
         searchProgressTasks[jobID]?.cancel()
         let baselineModifiedAt = Self.fileModificationDate(path: outputPath)
         var snapshot = searchProgress
         snapshot.stage = .searching
-        snapshot.status = "Searching database"
+        snapshot.status = activeStatus
         snapshot.outputBytes = 0
         snapshot.lastUpdated = Date()
         searchProgress = snapshot
@@ -2756,7 +3180,7 @@ final class AppModel: ObservableObject {
                     guard snapshot.isActive else { return }
                     snapshot.stage = .searching
                     snapshot.outputBytes = displayedOutputBytes
-                    snapshot.status = displayedOutputBytes > 0 ? "Writing BLAST report" : "Searching database"
+                    snapshot.status = displayedOutputBytes > 0 ? writingStatus : activeStatus
                     snapshot.lastUpdated = Date()
                     self.searchProgress = snapshot
                 }
@@ -2937,13 +3361,17 @@ final class AppModel: ObservableObject {
     }
 
     func loadHelpForSelectedProgram() async {
-        guard let executable = ProcessClient.resolveExecutable(named: configuration.program.executableName, preferences: preferences) else {
-            helpText = LocalBlastError.toolMissing(configuration.program.executableName).localizedDescription
+        let executableName = configuration.alignMultipleSequences
+            ? MultipleSequenceAlignmentCommandBuilder.executableName
+            : configuration.program.executableName
+        guard let executable = ProcessClient.resolveExecutable(named: executableName, preferences: preferences) else {
+            helpText = LocalBlastError.toolMissing(executableName).localizedDescription
             return
         }
         do {
+            let arguments = configuration.alignMultipleSequences ? ["--help"] : ["-help"]
             let result = try await Task.detached {
-                try ProcessClient.runSync(executableURL: executable, arguments: ["-help"])
+                try ProcessClient.runSync(executableURL: executable, arguments: arguments)
             }.value
             helpText = result.output
         } catch {
@@ -3016,6 +3444,16 @@ final class AppModel: ObservableObject {
         return count > 0 ? count : nil
     }
 
+    private func fastaRecordCount(filePath: String) -> Int {
+        guard let text = try? String(contentsOfFile: filePath, encoding: .utf8) else {
+            return 0
+        }
+        return text
+            .components(separatedBy: .newlines)
+            .filter { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix(">") }
+            .count
+    }
+
     private static func sequenceResidueCount(in text: String) -> Int {
         text.components(separatedBy: .newlines).reduce(0) { total, line in
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3027,28 +3465,160 @@ final class AppModel: ObservableObject {
 
 struct RootView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var resultsSidebarWidth: CGFloat = 340
+    @State private var resizeStartWidth: CGFloat?
+    @State private var lastAppliedResizeWidth: CGFloat?
+
+    private let resultsMinimumWidth: CGFloat = 280
+    private let resultsMaximumWidth: CGFloat = 720
+    private let detailMinimumWidth: CGFloat = 560
+    private let resizeCoordinateSpace = "ResultsSplitResizeSpace"
 
     var body: some View {
-        NavigationSplitView {
-            List(WorkspaceSection.allCases, selection: $model.section) { section in
-                Label(section.rawValue, systemImage: section.systemImage)
-                    .tag(section)
-            }
-            .navigationSplitViewColumnWidth(220)
-        } detail: {
-            switch model.section {
-            case .run:
-                RunBlastView()
-            case .rnaSeq:
-                RNASeqView()
-            case .results:
-                ResultsView()
-            case .databases:
-                DatabasesView()
-            case .tools:
-                ToolsView()
+        VStack(spacing: 0) {
+            WorkspaceTopBar()
+            Divider()
+            GeometryReader { proxy in
+                let clampedWidth = clampedResultsWidth(for: proxy.size.width)
+                HStack(spacing: 0) {
+                    ResultsSidebarPanel()
+                        .frame(width: clampedWidth)
+                        .transaction { transaction in
+                            transaction.animation = nil
+                            transaction.disablesAnimations = true
+                        }
+                    SplitResizeHandle()
+                        .gesture(resizeGesture(totalWidth: proxy.size.width))
+                    workspaceDetail
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .layoutPriority(1)
+                        .transaction { transaction in
+                            transaction.animation = nil
+                            transaction.disablesAnimations = true
+                        }
+                }
+                .transaction { transaction in
+                    transaction.animation = nil
+                    transaction.disablesAnimations = true
+                }
+                .coordinateSpace(name: resizeCoordinateSpace)
             }
         }
+    }
+
+    private func clampedResultsWidth(for totalWidth: CGFloat) -> CGFloat {
+        min(max(resultsSidebarWidth, resultsMinimumWidth), availableMaximumResultsWidth(for: totalWidth))
+    }
+
+    private func availableMaximumResultsWidth(for totalWidth: CGFloat) -> CGFloat {
+        max(resultsMinimumWidth, min(resultsMaximumWidth, totalWidth - detailMinimumWidth))
+    }
+
+    private func resizeGesture(totalWidth: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 2, coordinateSpace: .named(resizeCoordinateSpace))
+            .onChanged { value in
+                if resizeStartWidth == nil {
+                    resizeStartWidth = clampedResultsWidth(for: totalWidth)
+                    lastAppliedResizeWidth = resizeStartWidth
+                }
+
+                let stableTranslation = value.location.x - value.startLocation.x
+                let proposedWidth = ((resizeStartWidth ?? resultsSidebarWidth) + stableTranslation).rounded()
+                let nextWidth = min(
+                    max(proposedWidth, resultsMinimumWidth),
+                    availableMaximumResultsWidth(for: totalWidth)
+                )
+                guard lastAppliedResizeWidth != nextWidth else { return }
+
+                var transaction = Transaction(animation: nil)
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    resultsSidebarWidth = nextWidth
+                    lastAppliedResizeWidth = nextWidth
+                }
+            }
+            .onEnded { _ in
+                resizeStartWidth = nil
+                lastAppliedResizeWidth = nil
+            }
+    }
+
+    @ViewBuilder
+    private var workspaceDetail: some View {
+        switch model.section {
+        case .run:
+            RunBlastView(showsHeader: false)
+        case .rnaSeq:
+            RNASeqView(showsHeader: false)
+        case .results:
+            ResultsView()
+        case .databases:
+            DatabasesView(showsHeader: false)
+        case .tools:
+            ToolsView(showsHeader: false)
+        }
+    }
+}
+
+struct SplitResizeHandle: View {
+    var body: some View {
+        ZStack {
+            Color.clear
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor))
+                .frame(width: 1)
+        }
+        .frame(width: 12)
+        .contentShape(Rectangle())
+            .help("Drag to resize results")
+    }
+}
+
+struct WorkspaceTopBar: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        ZStack {
+            HStack {
+                Text("Local BLAST Studio")
+                    .font(.title3.bold())
+                    .lineLimit(1)
+                Spacer()
+            }
+            HStack(spacing: 6) {
+                ForEach(WorkspaceSection.topBarSections) { section in
+                    Button {
+                        model.section = section
+                    } label: {
+                        Label(section.rawValue, systemImage: section.systemImage)
+                            .labelStyle(.titleAndIcon)
+                            .lineLimit(1)
+                    }
+                    .buttonStyle(TopBarSectionButtonStyle(isSelected: model.section == section))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .center)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .background(.regularMaterial)
+    }
+}
+
+struct TopBarSectionButtonStyle: ButtonStyle {
+    var isSelected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.callout.weight(isSelected ? .semibold : .regular))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.14) : Color.clear)
+            )
+            .opacity(configuration.isPressed ? 0.75 : 1)
     }
 }
 
@@ -3060,8 +3630,204 @@ private func databaseEntrySort(_ lhs: BlastDatabaseEntry, _ rhs: BlastDatabaseEn
     return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
 }
 
+struct ResultsSidebarPanel: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                resultsHeader
+                if model.jobs.isEmpty {
+                    ContentUnavailableView(
+                        "No BLAST jobs yet",
+                        systemImage: "doc.text.magnifyingglass",
+                        description: Text("Run a search or open a saved result file.")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 220)
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(model.jobs) { job in
+                            jobRow(job)
+                        }
+                    }
+                }
+            }
+            .padding(12)
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+        .onAppear {
+            model.refreshResultFiles()
+            model.loadSelectedJobResult()
+        }
+        .onChange(of: model.selectedJobID) { _, _ in
+            model.loadSelectedJobResult()
+        }
+    }
+
+    private var resultsHeader: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label("Results", systemImage: "doc.text.magnifyingglass")
+                    .font(.headline)
+                Text("\(model.jobs.count.formatted())")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    model.refreshResultFiles()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Refresh result files")
+
+                Button {
+                    if let path = OpenPanel.chooseFile(allowedExtensions: ["txt", "tsv", "out", "aln", "clu"]) {
+                        model.importResultFile(path)
+                        model.section = .results
+                    }
+                } label: {
+                    Image(systemName: "doc.badge.plus")
+                }
+                .buttonStyle(.borderless)
+                .help("Open result file")
+            }
+
+            if model.selectedResultCount > 1 {
+                Text("\(model.selectedResultCount.formatted()) selected")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Menu {
+                    Button {
+                        if let path = OpenPanel.chooseDirectory() {
+                            model.exportSelectedResults(to: path)
+                        }
+                    } label: {
+                        Label("Export Selected (\(model.selectedResultCount.formatted()))", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(model.selectedResultCount == 0)
+
+                    Button {
+                        if let path = OpenPanel.chooseDirectory() {
+                            model.exportAllResults(to: path)
+                        }
+                    } label: {
+                        Label("Export All", systemImage: "tray.and.arrow.up")
+                    }
+                    .disabled(model.jobs.isEmpty)
+                } label: {
+                    Label("Export", systemImage: "square.and.arrow.up")
+                }
+                .disabled(model.jobs.isEmpty)
+                .help("Export selected or all results")
+
+                Button(role: .destructive) {
+                    model.deleteSelectedResults()
+                } label: {
+                    Label(model.selectedResultCount > 1 ? "Delete \(model.selectedResultCount.formatted())" : "Delete", systemImage: "trash")
+                }
+                .disabled(model.selectedResultCount == 0)
+                .help("Delete selected results")
+
+                Button(role: .destructive) {
+                    if AppDialog.confirmDeleteAllResults(count: model.jobs.count) {
+                        model.deleteAllResults()
+                    }
+                } label: {
+                    Label("Delete All", systemImage: "trash.circle")
+                }
+                .disabled(model.jobs.isEmpty)
+                .help("Delete all results")
+            }
+            .controlSize(.small)
+        }
+    }
+
+    private func jobRow(_ job: BlastJobRecord) -> some View {
+        let isSelected = model.selectedJobIDs.contains(job.id)
+        let isPrimary = model.selectedJobID == job.id
+        let usesSelectionActions = isSelected && model.selectedResultCount > 1
+        return HStack(alignment: .center, spacing: 8) {
+            ResultJobRow(job: job)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if model.isJobRunning(job.id) {
+                Button(role: .destructive) {
+                    model.killJob(job.id)
+                } label: {
+                    Image(systemName: "xmark.octagon")
+                }
+                .buttonStyle(.borderless)
+                .help("Kill this running job")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isSelected ? Color.accentColor.opacity(0.14) : Color(nsColor: .textBackgroundColor))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(isPrimary ? Color.accentColor.opacity(0.65) : (isSelected ? Color.accentColor.opacity(0.35) : Color.secondary.opacity(0.12)))
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            let modifierFlags = NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags
+            model.selectJob(
+                job,
+                extendingRange: modifierFlags.contains(.shift),
+                togglingSelection: modifierFlags.contains(.command)
+            )
+            model.section = .results
+        }
+        .contextMenu {
+            Button {
+                model.selectJob(job)
+                model.section = .results
+            } label: {
+                Label("Open Result", systemImage: "doc.text.magnifyingglass")
+            }
+
+            Button {
+                if let path = OpenPanel.chooseDirectory() {
+                    if usesSelectionActions {
+                        model.exportSelectedResults(to: path)
+                    } else {
+                        model.exportResult(job, to: path)
+                    }
+                }
+            } label: {
+                Label(
+                    usesSelectionActions ? "Export Selected (\(model.selectedResultCount.formatted()))" : "Export Result",
+                    systemImage: "square.and.arrow.up"
+                )
+            }
+
+            Divider()
+
+            Button(role: .destructive) {
+                if usesSelectionActions {
+                    model.deleteSelectedResults()
+                } else {
+                    model.deleteResult(job)
+                }
+            } label: {
+                Label(
+                    usesSelectionActions ? "Delete Selected (\(model.selectedResultCount.formatted()))" : "Delete Result",
+                    systemImage: "trash"
+                )
+            }
+            .disabled(!usesSelectionActions && model.isJobRunning(job.id))
+        }
+    }
+}
+
 struct RunBlastView: View {
     @EnvironmentObject private var model: AppModel
+    var showsHeader = true
     @State private var isStructureDropTargeted = false
 
     var availableDatabases: [BlastDatabaseEntry] {
@@ -3072,16 +3838,18 @@ struct RunBlastView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HeaderBar(
-                title: "Local BLAST",
-                subtitle: "\(model.configuration.program.summary) Everything runs through local BLAST+ binaries."
-            ) {
-                Button {
-                    Task { await model.loadHelpForSelectedProgram() }
-                } label: {
-                    Label("Load CLI Help", systemImage: "questionmark.circle")
+            if showsHeader {
+                HeaderBar(
+                    title: "Local BLAST",
+                    subtitle: "\(model.configuration.program.summary) Everything runs through local BLAST+ binaries."
+                ) {
+                    Button {
+                        Task { await model.loadHelpForSelectedProgram() }
+                    } label: {
+                        Label("Load CLI Help", systemImage: "questionmark.circle")
+                    }
+                    .help("Load the full -help output for the selected search tool.")
                 }
-                .help("Load the full -help output for the selected BLAST+ program.")
             }
 
             GeometryReader { proxy in
@@ -3120,12 +3888,16 @@ struct RunBlastView: View {
             querySection
             if model.configuration.program.isIgBlast {
                 igBlastSection
+            } else if model.configuration.alignMultipleSequences {
+                multipleAlignmentSection
             } else if model.configuration.alignTwoSequences {
                 subjectSection
             } else {
                 databaseSection
             }
-            ParameterEditorView(program: model.configuration.program, values: $model.configuration.optionValues)
+            if !model.configuration.alignMultipleSequences {
+                ParameterEditorView(program: model.configuration.program, values: $model.configuration.optionValues)
+            }
             advancedSection
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3162,7 +3934,7 @@ struct RunBlastView: View {
                 Text(model.configuration.program.queryKind.rawValue)
                     .foregroundStyle(.secondary)
             }
-            LabeledContent("Database") {
+            LabeledContent(model.configuration.alignMultipleSequences ? "Mode" : "Database") {
                 Text(databaseKindLabel)
                     .foregroundStyle(.secondary)
             }
@@ -3172,6 +3944,9 @@ struct RunBlastView: View {
     private var databaseKindLabel: String {
         if model.configuration.program.isIgBlast {
             return model.configuration.program == .igblastn ? "Germline V(D)J databases" : "Germline V database"
+        }
+        if model.configuration.alignMultipleSequences {
+            return "Multiple alignment"
         }
         return model.configuration.alignTwoSequences ? "Subject sequence" : model.configuration.program.databaseKind.rawValue
     }
@@ -3192,10 +3967,12 @@ struct RunBlastView: View {
 
             SequenceTextEditor(
                 text: $model.configuration.queryText,
-                placeholder: "Paste FASTA here when no query file is selected"
+                placeholder: model.configuration.alignMultipleSequences
+                    ? "Paste FASTA containing three or more sequences"
+                    : "Paste FASTA here when no query file is selected"
             )
 
-            if model.supportsStructureQueryImport {
+            if model.supportsStructureQueryImport, !model.configuration.alignMultipleSequences {
                 structureImportSection
             }
 
@@ -3203,8 +3980,18 @@ struct RunBlastView: View {
                 TextField("Query range, e.g. 1-250", text: $model.configuration.querySubrange)
                     .textFieldStyle(.roundedBorder)
                 if model.configuration.program.supportsPairwiseAlignment {
-                    Toggle("Align two sequences", isOn: $model.configuration.alignTwoSequences)
+                    Toggle("Align two sequences", isOn: Binding(
+                        get: { model.configuration.alignTwoSequences },
+                        set: { model.setPairwiseAlignmentEnabled($0) }
+                    ))
                         .toggleStyle(.checkbox)
+                    if model.configuration.program.supportsMultipleSequenceAlignment {
+                        Toggle("Align 3+ sequences", isOn: Binding(
+                            get: { model.configuration.alignMultipleSequences },
+                            set: { model.setMultipleSequenceAlignmentEnabled($0) }
+                        ))
+                        .toggleStyle(.checkbox)
+                    }
                 } else {
                     Label("Germline assignment", systemImage: "scope")
                         .font(.caption)
@@ -3212,6 +3999,54 @@ struct RunBlastView: View {
                 }
             }
         }
+    }
+
+    private var multipleAlignmentSection: some View {
+        Panel(title: "Multiple Sequence Alignment", systemImage: "text.alignleft") {
+            if let clustalOmegaStatus {
+                Label(
+                    clustalOmegaStatus.isAvailable ? "Clustal Omega ready" : "Clustal Omega missing",
+                    systemImage: clustalOmegaStatus.isAvailable ? "checkmark.circle.fill" : "xmark.octagon.fill"
+                )
+                .foregroundStyle(clustalOmegaStatus.isAvailable ? .green : .orange)
+                .font(.callout.weight(.semibold))
+                if clustalOmegaStatus.isAvailable {
+                    Text(clustalOmegaStatus.path)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                } else {
+                    Text("Install Clustal Omega (`clustalo`) and use Tools > Recheck. Homebrew: `brew install clustal-omega`. Conda: `conda install -c bioconda clustalo`.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                GridRow {
+                    Text("Engine")
+                        .foregroundStyle(.secondary)
+                    Text("Clustal Omega")
+                }
+                GridRow {
+                    Text("Sequence type")
+                        .foregroundStyle(.secondary)
+                    Text(model.configuration.program == .blastn ? "DNA" : "Protein")
+                }
+                GridRow {
+                    Text("Output format")
+                        .foregroundStyle(.secondary)
+                    Text("Clustal")
+                }
+            }
+            .font(.callout)
+        }
+    }
+
+    private var clustalOmegaStatus: ToolStatus? {
+        model.toolStatuses.first { $0.name == MultipleSequenceAlignmentCommandBuilder.executableName }
     }
 
     private var structureImportSection: some View {
@@ -3484,12 +4319,24 @@ struct RunBlastView: View {
 
     private var advancedSection: some View {
         Panel(title: "Advanced", systemImage: "terminal") {
-            TextField("Raw BLAST+/IgBLAST arguments, e.g. -dbsize 1000000 -parse_deflines", text: $model.configuration.rawArguments)
+            TextField(advancedPlaceholder, text: $model.configuration.rawArguments)
                 .textFieldStyle(.roundedBorder)
-            Text("Raw arguments are appended last, so they can cover BLAST+ and IgBLAST switches that are not exposed as structured controls yet.")
+            Text(advancedHelpText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private var advancedPlaceholder: String {
+        model.configuration.alignMultipleSequences
+            ? "Raw Clustal Omega arguments, e.g. --iterations=2"
+            : "Raw BLAST+/IgBLAST arguments, e.g. -dbsize 1000000 -parse_deflines"
+    }
+
+    private var advancedHelpText: String {
+        model.configuration.alignMultipleSequences
+            ? "Raw arguments are appended last for clustalo. The app does not add --threads automatically because many Clustal Omega builds do not support OpenMP thread overrides."
+            : "Raw arguments are appended last, so they can cover BLAST+ and IgBLAST switches that are not exposed as structured controls yet."
     }
 
     private var commandPreview: some View {
@@ -3524,11 +4371,20 @@ struct RunBlastView: View {
                 }
 
                 Button {
-                    if let path = OpenPanel.saveFile(defaultName: "blast-result.txt") {
+                    if let path = OpenPanel.saveFile(defaultName: model.configuration.alignMultipleSequences ? "alignment.aln" : "blast-result.txt") {
                         model.configuration.outputPath = path
                     }
                 } label: {
                     Label("Output", systemImage: "square.and.arrow.down")
+                }
+
+                if !showsHeader {
+                    Button {
+                        Task { await model.loadHelpForSelectedProgram() }
+                    } label: {
+                        Label("Help", systemImage: "questionmark.circle")
+                    }
+                    .help("Load the full -help output for the selected search tool.")
                 }
             }
         }
@@ -4113,6 +4969,7 @@ struct SequencePlainTextView: NSViewRepresentable {
 
 struct RNASeqView: View {
     @EnvironmentObject private var model: AppModel
+    var showsHeader = true
 
     private let supportedPrograms: [BlastProgram] = [.blastn, .blastx]
 
@@ -4130,10 +4987,12 @@ struct RNASeqView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HeaderBar(
-                title: "RNA-Seq Annotation",
-                subtitle: "Stream large trimmed and merged FASTQ files into local BLAST annotation jobs."
-            ) { }
+            if showsHeader {
+                HeaderBar(
+                    title: "RNA-Seq Annotation",
+                    subtitle: "Stream large trimmed and merged FASTQ files into local BLAST annotation jobs."
+                ) { }
+            }
 
             GeometryReader { proxy in
                 if proxy.size.width < 1050 {
@@ -4469,6 +5328,7 @@ struct RNASeqView: View {
 
 struct DatabasesView: View {
     @EnvironmentObject private var model: AppModel
+    var showsHeader = true
 
     private var installedNames: [String] {
         model.installedDatabaseSummary.names.sorted {
@@ -4496,16 +5356,18 @@ struct DatabasesView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HeaderBar(
-                title: "NCBI Databases",
-                subtitle: "Discover the live catalog, download selected databases, and build custom local databases."
-            ) {
-                Button {
-                    Task { await model.refreshDatabaseCatalog() }
-                } label: {
-                    Label("Refresh Catalog", systemImage: "arrow.clockwise")
+            if showsHeader {
+                HeaderBar(
+                    title: "NCBI Databases",
+                    subtitle: "Discover the live catalog, download selected databases, and build custom local databases."
+                ) {
+                    Button {
+                        Task { await model.refreshDatabaseCatalog() }
+                    } label: {
+                        Label("Refresh Catalog", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(model.isRefreshingCatalog)
                 }
-                .disabled(model.isRefreshingCatalog)
             }
 
             GeometryReader { proxy in
@@ -4583,6 +5445,15 @@ struct DatabasesView: View {
         Panel(title: "Download Catalog", systemImage: "tray.and.arrow.down") {
             TextField("Search databases", text: $model.databaseSearchText)
             HStack {
+                if !showsHeader {
+                    Button {
+                        Task { await model.refreshDatabaseCatalog() }
+                    } label: {
+                        Label("Refresh Catalog", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(model.isRefreshingCatalog)
+                }
+
                 Button {
                     for database in filteredDatabases {
                         model.selectedDatabaseNames.insert(database.name)
@@ -4909,17 +5780,20 @@ struct SummaryMetric: View {
 
 struct ToolsView: View {
     @EnvironmentObject private var model: AppModel
+    var showsHeader = true
 
     var body: some View {
         VStack(spacing: 0) {
-            HeaderBar(
-                title: "BLAST+ And IgBLAST Tools",
-                subtitle: "Point the app at an NCBI BLAST+/IgBLAST bin folder, then verify the local suite."
-            ) {
-                Button {
-                    Task { await model.refreshTools() }
-                } label: {
-                    Label("Recheck", systemImage: "arrow.clockwise")
+            if showsHeader {
+                HeaderBar(
+                    title: "External Tools",
+                    subtitle: "Point the app at BLAST+, IgBLAST, and Clustal Omega binaries, then verify the local suite."
+                ) {
+                    Button {
+                        Task { await model.refreshTools() }
+                    } label: {
+                        Label("Recheck", systemImage: "arrow.clockwise")
+                    }
                 }
             }
 
@@ -4927,7 +5801,7 @@ struct ToolsView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     Panel(title: "Location", systemImage: "folder.badge.gearshape") {
                         HStack {
-                            TextField("Optional BLAST+ bin directory", text: $model.preferences.blastBinDirectory)
+                            TextField("Optional tool bin directory", text: $model.preferences.blastBinDirectory)
                             Button {
                                 if let path = OpenPanel.chooseDirectory() {
                                     model.preferences.blastBinDirectory = path
@@ -4937,7 +5811,14 @@ struct ToolsView: View {
                                 Image(systemName: "folder")
                             }
                         }
-                        Text("Leave this empty to search PATH plus common Homebrew and /Applications NCBI BLAST+ locations.")
+                        if !showsHeader {
+                            Button {
+                                Task { await model.refreshTools() }
+                            } label: {
+                                Label("Recheck", systemImage: "arrow.clockwise")
+                            }
+                        }
+                        Text("Leave this empty to search PATH plus common Homebrew, Conda, and /Applications locations. For Align 3+ sequences, this folder must contain `clustalo` or `clustalo` must be on PATH.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -4971,10 +5852,13 @@ struct ToolsView: View {
                     }
 
                     Panel(title: "Install Notes", systemImage: "info.circle") {
-                        Text("Install NCBI BLAST+ and IgBLAST from NCBI, Homebrew, Conda, or a managed lab image. LocalBlastStudio does not bundle NCBI binaries or databases; it orchestrates them locally so versioning and data provenance stay visible.")
+                        Text("Install NCBI BLAST+, IgBLAST, and Clustal Omega from NCBI, Homebrew, Conda, or a managed lab image. LocalBlastStudio does not bundle external binaries or databases; it orchestrates them locally so versioning and data provenance stay visible.")
+                            .foregroundStyle(.secondary)
+                        Text("Clustal Omega executable name: clustalo. Homebrew: brew install clustal-omega. Conda: conda install -c bioconda clustalo.")
                             .foregroundStyle(.secondary)
                         Link("NCBI BLAST+ command line manual", destination: URL(string: "https://www.ncbi.nlm.nih.gov/books/NBK279690/")!)
                         Link("NCBI IgBLAST", destination: URL(string: "https://www.ncbi.nlm.nih.gov/igblast/")!)
+                        Link("Clustal Omega", destination: URL(string: "http://www.clustal.org/omega/")!)
                         Link("NCBI BLAST database downloads", destination: URL(string: "https://www.ncbi.nlm.nih.gov/books/NBK569850/")!)
                     }
                 }
@@ -4996,7 +5880,7 @@ struct ResultsView: View {
         VStack(spacing: 0) {
             HeaderBar(
                 title: "Results",
-                subtitle: "Completed jobs and BLAST result files are loaded into a local report viewer."
+                subtitle: "Selected BLAST jobs and alignment files open here with full report details."
             ) {
                 Button {
                     model.refreshResultFiles()
@@ -5005,7 +5889,7 @@ struct ResultsView: View {
                 }
 
                 Button {
-                    if let path = OpenPanel.chooseFile(allowedExtensions: ["txt", "tsv", "out"]) {
+                    if let path = OpenPanel.chooseFile(allowedExtensions: ["txt", "tsv", "out", "aln", "clu"]) {
                         model.importResultFile(path)
                     }
                 } label: {
@@ -5013,29 +5897,11 @@ struct ResultsView: View {
                 }
             }
 
-            GeometryReader { proxy in
-                if proxy.size.width < 1000 {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 16) {
-                            jobList
-                                .frame(minHeight: 280)
-                            selectedResult
-                        }
-                        .padding(20)
-                    }
-                } else {
-                    HStack(spacing: 0) {
-                        jobList
-                            .frame(width: min(max(proxy.size.width * 0.32, 320), 440))
-                        Divider()
-                        ScrollView {
-                            selectedResult
-                                .padding(20)
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                }
+            ScrollView {
+                selectedResult
+                    .padding(20)
             }
+            .frame(maxWidth: .infinity)
         }
         .onAppear {
             model.refreshResultFiles()
@@ -5044,57 +5910,6 @@ struct ResultsView: View {
         .onChange(of: model.selectedJobID) { _, _ in
             model.loadSelectedJobResult()
         }
-    }
-
-    private var jobList: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Label("Jobs", systemImage: "clock.arrow.circlepath")
-                    .font(.headline)
-                Spacer()
-                Text("\(model.jobs.count.formatted())")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-
-            List(selection: $model.selectedJobID) {
-                ForEach(model.jobs) { job in
-                    HStack(alignment: .center, spacing: 8) {
-                        ResultJobRow(job: job)
-                        if model.isJobRunning(job.id) {
-                            Button(role: .destructive) {
-                                model.killJob(job.id)
-                            } label: {
-                                Image(systemName: "xmark.octagon")
-                            }
-                            .buttonStyle(.borderless)
-                            .help("Kill this running job")
-                        }
-                    }
-                        .tag(job.id)
-                }
-            }
-            .overlay {
-                if model.jobs.isEmpty {
-                    ContentUnavailableView(
-                        "No BLAST jobs yet",
-                        systemImage: "doc.text.magnifyingglass",
-                        description: Text("Run a search or open a saved result file.")
-                    )
-                }
-            }
-
-            if !model.resultLog.isEmpty {
-                Text(model.resultLog)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .padding(12)
-            }
-        }
-        .background(Color(nsColor: .controlBackgroundColor))
     }
 
     @ViewBuilder
@@ -5129,7 +5944,7 @@ struct ResultsView: View {
             ContentUnavailableView(
                 "Select a job",
                 systemImage: "sidebar.left",
-                description: Text("Completed BLAST jobs and imported result files appear in the job list.")
+                description: Text("Choose a completed BLAST job or imported file from the persistent Results panel.")
             )
             .frame(maxWidth: .infinity, minHeight: 360)
         }
@@ -5154,6 +5969,16 @@ struct ResultsView: View {
                         .textSelection(.enabled)
                 }
                 Spacer()
+                Button {
+                    model.reuseResult(job)
+                } label: {
+                    Label("Re-use result for new search", systemImage: "arrow.uturn.forward.circle")
+                }
+                .buttonStyle(.bordered)
+                .disabled(job.reusableConfiguration == nil)
+                .help(job.reusableConfiguration == nil
+                    ? "This result does not include saved inputs and settings for reuse."
+                    : "Load this result's original inputs and settings into Run BLAST.")
                 if model.isJobRunning(job.id) {
                     Button(role: .destructive) {
                         model.killJob(job.id)
@@ -5237,7 +6062,7 @@ struct ResultJobRow: View {
             HStack(spacing: 10) {
                 Text(job.status.rawValue)
                     .foregroundStyle(statusColor)
-                Text(job.noHits ? "No hits" : hitLabel)
+                Text(job.kind == .multipleAlignment ? "Alignment" : (job.noHits ? "No hits" : hitLabel))
                 Text(ByteCountFormatter.string(fromByteCount: job.outputBytes, countStyle: .file))
                 Text("\(job.reservedThreads) CPU")
             }
@@ -5354,7 +6179,14 @@ struct BlastResultReportView: View {
     var fallbackProgram: String
     var fallbackDatabase: String
 
-    @State private var selectedPane: BlastResultPane = .descriptions
+    @State private var selectedPane: BlastResultPane
+
+    init(report: BlastResultReport, fallbackProgram: String, fallbackDatabase: String) {
+        self.report = report
+        self.fallbackProgram = fallbackProgram
+        self.fallbackDatabase = fallbackDatabase
+        _selectedPane = State(initialValue: Self.defaultPane(for: report, fallbackDatabase: fallbackDatabase))
+    }
 
     var body: some View {
         Panel(title: "BLAST Report", systemImage: "target") {
@@ -5384,6 +6216,28 @@ struct BlastResultReportView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .onChange(of: report.rawText) { _, _ in
+            selectedPane = Self.defaultPane(for: report, fallbackDatabase: fallbackDatabase)
+        }
+    }
+
+    private static func defaultPane(for report: BlastResultReport, fallbackDatabase: String) -> BlastResultPane {
+        if report.format == .multipleAlignment || isSubjectSequenceAlignment(report, fallbackDatabase: fallbackDatabase) {
+            return .raw
+        }
+        if !report.tabularRows.isEmpty, report.hits.isEmpty {
+            return .table
+        }
+        return .descriptions
+    }
+
+    private static func isSubjectSequenceAlignment(_ report: BlastResultReport, fallbackDatabase: String) -> Bool {
+        guard !report.alignments.isEmpty else { return false }
+        let context = "\(report.database) \(fallbackDatabase)".lowercased()
+        return context.contains("user specified sequence set")
+            || context.contains("subject sequence")
+            || context.contains("pairwise")
+            || context.contains("sequence alignment")
     }
 
     private var reportSummary: some View {
@@ -5528,13 +6382,8 @@ struct BlastResultReportView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
-                        ScrollView([.horizontal, .vertical]) {
-                            Text(alignment.text)
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(minHeight: 150, maxHeight: 260)
+                        MonospacedResultText(text: alignment.text)
+                        .frame(minHeight: 260, maxHeight: 520)
                     }
                     .padding(12)
                     .background(Color(nsColor: .textBackgroundColor))
@@ -5591,21 +6440,17 @@ struct BlastResultReportView: View {
     }
 
     private var rawPane: some View {
-        ScrollView([.horizontal, .vertical]) {
-            Text(rawPaneText)
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .frame(minHeight: 300, maxHeight: 620)
+        MonospacedResultText(text: rawPaneText)
+        .frame(minHeight: 560, idealHeight: 760, maxHeight: 900)
     }
 
     private var rawPaneText: String {
+        let displayRawText = rawTextWithoutOuterBlankLines(rawTextWithoutCitationBlocks(report.rawText))
         guard !report.igBlastDomainRegions.isEmpty else {
-            return report.rawText
+            return displayRawText
         }
 
-        let annotatedRawText = rawTextWithIgBlastDomainRulers(report.rawText)
+        let annotatedRawText = rawTextWithIgBlastDomainRulers(displayRawText)
         let brackets = report.igBlastDomainRegions
             .map { domainBracketLabel($0) }
             .joined(separator: " ")
@@ -5626,6 +6471,95 @@ struct BlastResultReportView: View {
         Native IgBLAST output:
         \(annotatedRawText)
         """
+    }
+
+    private func rawTextWithoutOuterBlankLines(_ rawText: String) -> String {
+        let normalizedText = rawText
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        var lines = normalizedText.components(separatedBy: "\n")
+
+        while lines.first?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+            lines.removeFirst()
+        }
+        while lines.last?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+            lines.removeLast()
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private func rawTextWithoutCitationBlocks(_ rawText: String) -> String {
+        let normalizedText = rawText
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let lines = normalizedText.components(separatedBy: "\n")
+        var output: [String] = []
+        var index = 0
+
+        while index < lines.count {
+            let trimmed = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
+            if isCitationBlockStart(trimmed) {
+                index += 1
+                while index < lines.count {
+                    let nextTrimmed = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
+                    if nextTrimmed.isEmpty {
+                        index += 1
+                        while index < lines.count,
+                              lines[index].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            index += 1
+                        }
+                        break
+                    }
+                    if isRawReportSectionStart(nextTrimmed) {
+                        break
+                    }
+                    index += 1
+                }
+                appendSingleBlankLine(to: &output)
+                continue
+            }
+            output.append(lines[index])
+            index += 1
+        }
+
+        return collapsedBlankLines(output).joined(separator: "\n")
+    }
+
+    private func isCitationBlockStart(_ trimmedLine: String) -> Bool {
+        trimmedLine.hasPrefix("Reference:")
+            || trimmedLine.hasPrefix("Reference for ")
+            || trimmedLine.hasPrefix("Please cite:")
+    }
+
+    private func isRawReportSectionStart(_ trimmedLine: String) -> Bool {
+        trimmedLine.hasPrefix("Database:")
+            || trimmedLine.hasPrefix("Query=")
+            || trimmedLine.hasPrefix("RID:")
+            || trimmedLine.hasPrefix("Sequences producing significant alignments")
+            || trimmedLine.hasPrefix(">")
+    }
+
+    private func appendSingleBlankLine(to output: inout [String]) {
+        guard !output.isEmpty, output.last?.isEmpty == false else { return }
+        output.append("")
+    }
+
+    private func collapsedBlankLines(_ lines: [String]) -> [String] {
+        var collapsed: [String] = []
+        var blankCount = 0
+        for line in lines {
+            if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                blankCount += 1
+                if blankCount <= 1 {
+                    collapsed.append("")
+                }
+            } else {
+                blankCount = 0
+                collapsed.append(line)
+            }
+        }
+        return collapsed
     }
 
     private func rawTextWithIgBlastDomainRulers(_ rawText: String) -> String {
@@ -5803,6 +6737,22 @@ struct BlastResultReportView: View {
     }
 }
 
+private struct MonospacedResultText: View {
+    var text: String
+
+    var body: some View {
+        GeometryReader { proxy in
+            ScrollView([.horizontal, .vertical]) {
+                Text(text)
+                    .font(.system(size: 14, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(minWidth: proxy.size.width, alignment: .topLeading)
+            }
+            .defaultScrollAnchor(.topLeading)
+        }
+    }
+}
+
 struct HeaderBar<Trailing: View>: View {
     var title: String
     var subtitle: String
@@ -5881,5 +6831,19 @@ enum OpenPanel {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = defaultName
         return panel.runModal() == .OK ? panel.url?.path : nil
+    }
+}
+
+enum AppDialog {
+    @MainActor
+    static func confirmDeleteAllResults(count: Int) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete all results?"
+        alert.informativeText = "This will move \(count.formatted()) result file\(count == 1 ? "" : "s") and any saved reuse metadata to the Trash. This cannot be undone from Local BLAST Studio."
+        alert.addButton(withTitle: "Delete All")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        return alert.runModal() == .alertFirstButtonReturn
     }
 }

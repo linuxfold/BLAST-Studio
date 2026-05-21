@@ -38,6 +38,10 @@ public enum BlastProgram: String, CaseIterable, Codable, Identifiable, Sendable 
         !isIgBlast
     }
 
+    public var supportsMultipleSequenceAlignment: Bool {
+        self == .blastn || self == .blastp
+    }
+
     public var displayName: String {
         switch self {
         case .blastn: "BLASTN"
@@ -1211,6 +1215,7 @@ public struct BlastSearchConfiguration: Codable, Equatable, Sendable {
     public var queryFilePath: String
     public var querySubrange: String
     public var alignTwoSequences: Bool
+    public var alignMultipleSequences: Bool
     public var subjectText: String
     public var subjectFilePath: String
     public var subjectSubrange: String
@@ -1227,6 +1232,7 @@ public struct BlastSearchConfiguration: Codable, Equatable, Sendable {
         queryFilePath: String = "",
         querySubrange: String = "",
         alignTwoSequences: Bool = false,
+        alignMultipleSequences: Bool = false,
         subjectText: String = "",
         subjectFilePath: String = "",
         subjectSubrange: String = "",
@@ -1242,6 +1248,7 @@ public struct BlastSearchConfiguration: Codable, Equatable, Sendable {
         self.queryFilePath = queryFilePath
         self.querySubrange = querySubrange
         self.alignTwoSequences = alignTwoSequences
+        self.alignMultipleSequences = alignMultipleSequences
         self.subjectText = subjectText
         self.subjectFilePath = subjectFilePath
         self.subjectSubrange = subjectSubrange
@@ -1281,10 +1288,12 @@ public struct BlastCommand: Equatable, Sendable {
 public enum BlastCommandBuildError: Error, LocalizedError, Equatable {
     case missingQuery
     case missingSubject
+    case missingMultipleSequences
     case missingDatabase
     case missingOutputPath
     case missingGermlineVDatabase
     case unsupportedPairwiseProgram(String)
+    case unsupportedMultipleSequenceProgram(String)
     case malformedRawArguments(String)
 
     public var errorDescription: String? {
@@ -1293,6 +1302,8 @@ public enum BlastCommandBuildError: Error, LocalizedError, Equatable {
             "Choose a query file or paste a FASTA query."
         case .missingSubject:
             "Choose a subject file or paste a subject FASTA sequence."
+        case .missingMultipleSequences:
+            "Provide a FASTA file or paste FASTA containing at least three sequences."
         case .missingDatabase:
             "Choose a BLAST database."
         case .missingOutputPath:
@@ -1301,6 +1312,8 @@ public enum BlastCommandBuildError: Error, LocalizedError, Equatable {
             "Choose an IgBLAST germline V database."
         case .unsupportedPairwiseProgram(let program):
             "\(program) does not support Align two sequences mode."
+        case .unsupportedMultipleSequenceProgram(let program):
+            "\(program) does not support Align 3+ sequences mode. Use BLASTN or BLASTP."
         case .malformedRawArguments(let value):
             "Could not parse advanced arguments near: \(value)"
         }
@@ -1321,6 +1334,10 @@ public enum BlastCommandBuilder {
 
         if configuration.program.isIgBlast {
             return try buildIgBlast(configuration: configuration, queryPath: query)
+        }
+
+        guard !configuration.alignMultipleSequences else {
+            throw BlastCommandBuildError.unsupportedMultipleSequenceProgram(configuration.program.displayName)
         }
 
         var arguments = ["-query", query]
@@ -1369,6 +1386,9 @@ public enum BlastCommandBuilder {
         configuration: BlastSearchConfiguration,
         queryPath: String
     ) throws -> BlastCommand {
+        if configuration.alignMultipleSequences {
+            throw BlastCommandBuildError.unsupportedMultipleSequenceProgram(configuration.program.displayName)
+        }
         guard !configuration.alignTwoSequences else {
             throw BlastCommandBuildError.unsupportedPairwiseProgram(configuration.program.displayName)
         }
@@ -1427,7 +1447,7 @@ public enum BlastCommandBuilder {
     }
 
     private static func environment(for configuration: BlastSearchConfiguration) -> [String: String] {
-        guard !configuration.alignTwoSequences else { return [:] }
+        guard !configuration.alignTwoSequences && !configuration.alignMultipleSequences else { return [:] }
         let directory = configuration.databaseDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         let databaseName = configuration.databaseName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !directory.isEmpty, !isPathLikeDatabaseName(databaseName) else { return [:] }
@@ -1511,9 +1531,44 @@ public enum BlastCommandBuilder {
     }
 }
 
+public enum MultipleSequenceAlignmentCommandBuilder {
+    public static let executableName = "clustalo"
+
+    public static func build(
+        configuration: BlastSearchConfiguration,
+        inputPath: String
+    ) throws -> BlastCommand {
+        guard configuration.program.supportsMultipleSequenceAlignment else {
+            throw BlastCommandBuildError.unsupportedMultipleSequenceProgram(configuration.program.displayName)
+        }
+        let input = inputPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { throw BlastCommandBuildError.missingQuery }
+        let output = configuration.outputPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !output.isEmpty else { throw BlastCommandBuildError.missingOutputPath }
+
+        let sequenceType = configuration.program == .blastn ? "DNA" : "Protein"
+        var arguments = [
+            "-i", input,
+            "-o", output,
+            "--force",
+            "--outfmt=clu",
+            "--seqtype=\(sequenceType)"
+        ]
+
+        do {
+            arguments.append(contentsOf: try BlastCommandBuilder.splitShellArguments(configuration.rawArguments))
+        } catch {
+            throw BlastCommandBuildError.malformedRawArguments(configuration.rawArguments)
+        }
+
+        return BlastCommand(executableName: executableName, arguments: arguments)
+    }
+}
+
 public enum BlastResultFormat: String, Codable, Sendable {
     case pairwise
     case tabular
+    case multipleAlignment = "multiple alignment"
     case text
 }
 
@@ -1699,8 +1754,13 @@ public enum BlastResultParser {
         let igBlastDomainRegions = parseIgBlastDomainRegions(lines)
         let hits = pairwiseHits.isEmpty ? tabularHits(rows: tabular.rows, headers: tabular.headers) : pairwiseHits
         let noHits = normalizedText.range(of: "No hits found", options: .caseInsensitive) != nil
+        let isMultipleAlignment = lines.first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .hasPrefix("CLUSTAL") == true
         let format: BlastResultFormat
-        if !tabular.rows.isEmpty, pairwiseHits.isEmpty, alignments.isEmpty {
+        if isMultipleAlignment {
+            format = .multipleAlignment
+        } else if !tabular.rows.isEmpty, pairwiseHits.isEmpty, alignments.isEmpty {
             format = .tabular
         } else if !pairwiseHits.isEmpty || !alignments.isEmpty || noHits {
             format = .pairwise
@@ -1728,7 +1788,7 @@ public enum BlastResultParser {
     private static func parseProgram(_ lines: [String]) -> String {
         lines
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { $0.hasPrefix("BLAST") || $0.hasPrefix("IGBLAST") || $0.hasPrefix("IgBLAST") } ?? ""
+            .first { $0.hasPrefix("BLAST") || $0.hasPrefix("IGBLAST") || $0.hasPrefix("IgBLAST") || $0.hasPrefix("CLUSTAL") } ?? ""
     }
 
     private static func parseQuery(_ lines: [String]) -> String {

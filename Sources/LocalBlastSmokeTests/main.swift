@@ -60,6 +60,22 @@ do {
     require(pairwiseCommand.arguments.contains("-query_loc"), "pairwise command missing query range")
     require(pairwiseCommand.arguments.contains("-subject_loc"), "pairwise command missing subject range")
 
+    var multipleAlignment = BlastSearchConfiguration(
+        program: .blastp,
+        outputPath: "/tmp/alignment.aln"
+    )
+    multipleAlignment.alignMultipleSequences = true
+    multipleAlignment.rawArguments = "--iterations=2"
+    let multipleAlignmentCommand = try MultipleSequenceAlignmentCommandBuilder.build(
+        configuration: multipleAlignment,
+        inputPath: "/tmp/proteins.faa"
+    )
+    require(multipleAlignmentCommand.executableName == "clustalo", "multiple alignment should use clustalo")
+    require(multipleAlignmentCommand.arguments.contains("-i") && multipleAlignmentCommand.arguments.contains("/tmp/proteins.faa"), "multiple alignment missing input")
+    require(multipleAlignmentCommand.arguments.contains("--seqtype=Protein"), "protein multiple alignment missing seqtype")
+    require(!multipleAlignmentCommand.arguments.contains { $0.hasPrefix("--threads") }, "multiple alignment should not add thread overrides")
+    require(multipleAlignmentCommand.arguments.contains("--iterations=2"), "multiple alignment raw args not appended")
+
     var igBlast = BlastSearchConfiguration(
         program: .igblastn,
         databaseDirectory: "/blast/db",
@@ -182,6 +198,17 @@ do {
     require(tabularReport.tabularRows.count == 1, "tabular row not parsed")
     require(tabularReport.hits[0].accession == "Subject_alpha", "tabular subject not parsed")
     require(tabularReport.hits[0].identity == "99.0%", "tabular identity not parsed")
+
+    let clustalReportText = """
+    CLUSTAL O(1.2.4) multiple sequence alignment
+
+    seq1      ACGT
+    seq2      A-GT
+    seq3      ACG-
+    """
+    let clustalReport = BlastResultParser.parse(clustalReportText)
+    require(clustalReport.format == .multipleAlignment, "Clustal report format not detected")
+    require(clustalReport.program.hasPrefix("CLUSTAL"), "Clustal program line not parsed")
 
     let igBlastDomainReportText = """
     IGBLASTP 1.22.0
