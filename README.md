@@ -25,6 +25,14 @@ The app is intentionally local-first. It does not contact NCBI on launch, and it
 - Shows installed database count, storage use, file count, installed database badges, and catalog entries that are not installed.
 - Packages as a standard macOS `.app` bundle with a custom icon.
 
+## What's New In 0.5.0
+
+- Added a **Sequence** workspace with ExPASy-style offline tools: six-frame **Translate** (14 NCBI genetic codes) with an ORF finder, **Reverse Complement** (plus complement and reverse), organism-aware **Back-translate** (human / E. coli codon usage), and **ProtParam**.
+- **ProtParam** reports molecular weight, theoretical pI, amino-acid and atomic composition, molecular formula, extinction coefficients, estimated half-life, instability index, aliphatic index, and GRAVY — validated to match ExPASy output.
+- Added a **Transform** menu on the Run BLAST query so a query can be reverse-complemented in place or handed to any Sequence tool, and results can be pushed back with **Use as query** / **Send to ProtParam**.
+- Tightened the whole UI for density: lighter panels and headers, compact result rows, parameter help moved to hover tooltips, and a slimmer top bar.
+- Updated packaging to produce `BLAST-Studio-0.5.0-universal.dmg`.
+
 ## What's New In 0.4.0
 
 - Added BLASTN/BLASTP **Align 3+ sequences** mode backed by local Clustal Omega (`clustalo`).
