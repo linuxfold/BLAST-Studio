@@ -27,22 +27,42 @@ struct LocalBlastStudioApp: App {
 
 enum WorkspaceSection: String, CaseIterable, Identifiable {
     case run = "Run BLAST"
+    case sequence = "Sequence"
     case rnaSeq = "RNA-Seq"
     case results = "Results"
     case databases = "Databases"
     case tools = "Tools"
 
-    static let topBarSections: [WorkspaceSection] = [.run, .results, .rnaSeq, .databases, .tools]
+    static let topBarSections: [WorkspaceSection] = [.run, .sequence, .results, .rnaSeq, .databases, .tools]
 
     var id: String { rawValue }
 
     var systemImage: String {
         switch self {
         case .run: "play.circle"
+        case .sequence: "circle.hexagongrid"
         case .rnaSeq: "waveform.path.ecg"
         case .results: "doc.text.magnifyingglass"
         case .databases: "internaldrive"
         case .tools: "wrench.and.screwdriver"
+        }
+    }
+}
+
+enum SequenceToolKind: String, CaseIterable, Identifiable {
+    case translate = "Translate"
+    case reverseComplement = "Reverse Complement"
+    case backTranslate = "Back-translate"
+    case protParam = "ProtParam"
+
+    var id: String { rawValue }
+
+    var systemImage: String {
+        switch self {
+        case .translate: "arrow.right.square"
+        case .reverseComplement: "arrow.left.and.right.righttriangle.left.righttriangle.right"
+        case .backTranslate: "arrow.uturn.backward.square"
+        case .protParam: "atom"
         }
     }
 }
@@ -987,6 +1007,10 @@ private extension Data {
 @MainActor
 final class AppModel: ObservableObject {
     @Published var section: WorkspaceSection = .run
+    @Published var sequenceInput: String = ""
+    @Published var sequenceTool: SequenceToolKind = .translate
+    @Published var sequenceGeneticCodeID: Int = 1
+    @Published var sequenceCodonUsageID: String = "human"
     @Published var preferences: BlastPreferences {
         didSet {
             preferences.save()
@@ -1250,6 +1274,20 @@ final class AppModel: ObservableObject {
         refreshStructureQueryTextForSelectedProgram()
         ensureDefaultOutputPath()
         updateCommandPreview()
+    }
+
+    // MARK: - Sequence tools
+
+    func openSequenceTool(_ kind: SequenceToolKind, with text: String) {
+        sequenceInput = text
+        sequenceTool = kind
+        section = .sequence
+    }
+
+    func useSequenceAsQuery(_ text: String) {
+        configuration.queryFilePath = ""
+        configuration.queryText = text
+        section = .run
     }
 
     func setPairwiseAlignmentEnabled(_ isEnabled: Bool) {
@@ -3465,13 +3503,13 @@ final class AppModel: ObservableObject {
 
 struct RootView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var resultsSidebarWidth: CGFloat = 340
+    @State private var resultsSidebarWidth: CGFloat = 300
     @State private var resizeStartWidth: CGFloat?
     @State private var lastAppliedResizeWidth: CGFloat?
 
-    private let resultsMinimumWidth: CGFloat = 280
+    private let resultsMinimumWidth: CGFloat = 260
     private let resultsMaximumWidth: CGFloat = 720
-    private let detailMinimumWidth: CGFloat = 560
+    private let detailMinimumWidth: CGFloat = 540
     private let resizeCoordinateSpace = "ResultsSplitResizeSpace"
 
     var body: some View {
@@ -3548,6 +3586,8 @@ struct RootView: View {
         switch model.section {
         case .run:
             RunBlastView(showsHeader: false)
+        case .sequence:
+            SequenceToolsView()
         case .rnaSeq:
             RNASeqView(showsHeader: false)
         case .results:
@@ -3568,7 +3608,7 @@ struct SplitResizeHandle: View {
                 .fill(Color(nsColor: .separatorColor))
                 .frame(width: 1)
         }
-        .frame(width: 12)
+        .frame(width: 8)
         .contentShape(Rectangle())
             .help("Drag to resize results")
     }
@@ -3580,12 +3620,13 @@ struct WorkspaceTopBar: View {
     var body: some View {
         ZStack {
             HStack {
-                Text("Local BLAST Studio")
-                    .font(.title3.bold())
+                Label("BLAST Studio", systemImage: "atom")
+                    .font(.headline)
+                    .labelStyle(.titleAndIcon)
                     .lineLimit(1)
                 Spacer()
             }
-            HStack(spacing: 6) {
+            HStack(spacing: 4) {
                 ForEach(WorkspaceSection.topBarSections) { section in
                     Button {
                         model.section = section
@@ -3599,8 +3640,8 @@ struct WorkspaceTopBar: View {
             }
             .frame(maxWidth: .infinity, alignment: .center)
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 7)
         .background(.regularMaterial)
     }
 }
@@ -3611,8 +3652,8 @@ struct TopBarSectionButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.callout.weight(isSelected ? .semibold : .regular))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 5)
             .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -3645,14 +3686,14 @@ struct ResultsSidebarPanel: View {
                     )
                     .frame(maxWidth: .infinity, minHeight: 220)
                 } else {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 5) {
                         ForEach(model.jobs) { job in
                             jobRow(job)
                         }
                     }
                 }
             }
-            .padding(12)
+            .padding(10)
         }
         .background(Color(nsColor: .controlBackgroundColor))
         .onAppear {
@@ -3761,10 +3802,20 @@ struct ResultsSidebarPanel: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Kill this running job")
+            } else {
+                Button {
+                    model.deleteResult(job)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .imageScale(.large)
+                }
+                .buttonStyle(.borderless)
+                .help("Delete this result (moves the file to Trash)")
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(isSelected ? Color.accentColor.opacity(0.14) : Color(nsColor: .textBackgroundColor))
@@ -3855,17 +3906,17 @@ struct RunBlastView: View {
             GeometryReader { proxy in
                 if proxy.size.width < 1050 {
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 12) {
                             runControls
                             runSidebar
                         }
-                        .padding(20)
+                        .padding(16)
                     }
                 } else {
                     HStack(spacing: 0) {
                         ScrollView {
                             runControls
-                                .padding(20)
+                                .padding(16)
                         }
                         .frame(minWidth: 0, maxWidth: .infinity)
 
@@ -3873,7 +3924,7 @@ struct RunBlastView: View {
 
                         ScrollView {
                             runSidebar
-                                .padding(20)
+                                .padding(16)
                         }
                         .frame(width: min(max(proxy.size.width * 0.38, 420), 620))
                     }
@@ -3883,7 +3934,7 @@ struct RunBlastView: View {
     }
 
     private var runControls: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
             programSection
             querySection
             if model.configuration.program.isIgBlast {
@@ -3963,6 +4014,7 @@ struct RunBlastView: View {
                     Image(systemName: "folder")
                 }
                 .help("Choose a FASTA query file.")
+                queryTransformMenu
             }
 
             SequenceTextEditor(
@@ -3999,6 +4051,47 @@ struct RunBlastView: View {
                 }
             }
         }
+    }
+
+    private var currentQueryText: String {
+        let pasted = model.configuration.queryText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !pasted.isEmpty { return model.configuration.queryText }
+        return (try? String(contentsOfFile: model.configuration.queryFilePath, encoding: .utf8)) ?? ""
+    }
+
+    private var queryTransformMenu: some View {
+        Menu {
+            Button {
+                let rc = SequenceTools.reverseComplement(currentQueryText)
+                if !rc.isEmpty {
+                    model.configuration.queryFilePath = ""
+                    model.configuration.queryText = rc
+                }
+            } label: {
+                Label("Reverse complement (in place)", systemImage: "arrow.left.and.right")
+            }
+            Divider()
+            Button {
+                model.openSequenceTool(.translate, with: currentQueryText)
+            } label: {
+                Label("Translate…", systemImage: "arrow.right.square")
+            }
+            Button {
+                model.openSequenceTool(.reverseComplement, with: currentQueryText)
+            } label: {
+                Label("Open in Reverse Complement…", systemImage: "arrow.left.and.right")
+            }
+            Button {
+                model.openSequenceTool(.protParam, with: currentQueryText)
+            } label: {
+                Label("ProtParam…", systemImage: "atom")
+            }
+        } label: {
+            Image(systemName: "wand.and.stars")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Transform the query sequence with the Sequence tools")
     }
 
     private var multipleAlignmentSection: some View {
@@ -4195,16 +4288,16 @@ struct RunBlastView: View {
 
     private var igBlastSection: some View {
         Panel(title: "IgBLAST Germline Setup", systemImage: "scope") {
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 7) {
                 GridRow {
                     Text("Organism")
-                        .frame(width: 190, alignment: .leading)
+                        .frame(width: 152, alignment: .leading)
                     TextField("human", text: $model.configuration.igBlast.organism)
                         .textFieldStyle(.roundedBorder)
                 }
                 GridRow {
                     Text("Sequence type")
-                        .frame(width: 190, alignment: .leading)
+                        .frame(width: 152, alignment: .leading)
                     Picker("Sequence type", selection: $model.configuration.igBlast.sequenceType) {
                         Text("Immunoglobulin").tag("Ig")
                         Text("T cell receptor").tag("TCR")
@@ -4213,7 +4306,7 @@ struct RunBlastView: View {
                 }
                 GridRow {
                     Text("IGDATA directory")
-                        .frame(width: 190, alignment: .leading)
+                        .frame(width: 152, alignment: .leading)
                     HStack {
                         TextField("Folder containing internal_data and optional_file", text: $model.configuration.igBlast.igDataDirectory)
                             .textFieldStyle(.roundedBorder)
@@ -4228,39 +4321,39 @@ struct RunBlastView: View {
                     }
                 }
                 GridRow {
-                    Color.clear.frame(width: 190, height: 0)
+                    Color.clear.frame(width: 152, height: 0)
                     Text("IgBLAST uses IGDATA to find internal_data and optional_file support files. Leave it empty if your shell environment already provides IGDATA.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 GridRow {
                     Text("Germline V database")
-                        .frame(width: 190, alignment: .leading)
+                        .frame(width: 152, alignment: .leading)
                     TextField("database/human_gl_V or an absolute database prefix", text: $model.configuration.igBlast.germlineVDatabase)
                         .textFieldStyle(.roundedBorder)
                 }
                 if model.configuration.program == .igblastn {
                     GridRow {
                         Text("Germline D database")
-                            .frame(width: 190, alignment: .leading)
+                            .frame(width: 152, alignment: .leading)
                         TextField("database/human_gl_D", text: $model.configuration.igBlast.germlineDDatabase)
                             .textFieldStyle(.roundedBorder)
                     }
                     GridRow {
                         Text("Germline J database")
-                            .frame(width: 190, alignment: .leading)
+                            .frame(width: 152, alignment: .leading)
                         TextField("database/human_gl_J", text: $model.configuration.igBlast.germlineJDatabase)
                             .textFieldStyle(.roundedBorder)
                     }
                     GridRow {
                         Text("C region database")
-                            .frame(width: 190, alignment: .leading)
+                            .frame(width: 152, alignment: .leading)
                         TextField("Optional constant-region database prefix", text: $model.configuration.igBlast.cRegionDatabase)
                             .textFieldStyle(.roundedBorder)
                     }
                     GridRow {
                         Text("Auxiliary data")
-                            .frame(width: 190, alignment: .leading)
+                            .frame(width: 152, alignment: .leading)
                         HStack {
                             TextField("optional_file/human_gl.aux", text: $model.configuration.igBlast.auxiliaryDataPath)
                                 .textFieldStyle(.roundedBorder)
@@ -4277,7 +4370,7 @@ struct RunBlastView: View {
                 }
                 GridRow {
                     Text("Additional database")
-                        .frame(width: 190, alignment: .leading)
+                        .frame(width: 152, alignment: .leading)
                     Picker("Additional database", selection: $model.configuration.igBlast.additionalDatabaseName) {
                         Text("None").tag("")
                         ForEach(availableDatabases) { database in
@@ -4288,13 +4381,13 @@ struct RunBlastView: View {
                     .labelsHidden()
                 }
                 GridRow {
-                    Color.clear.frame(width: 190, height: 0)
+                    Color.clear.frame(width: 152, height: 0)
                     TextField("Additional database name or path", text: $model.configuration.igBlast.additionalDatabaseName)
                         .textFieldStyle(.roundedBorder)
                 }
                 GridRow {
                     Text("Additional DB dir")
-                        .frame(width: 190, alignment: .leading)
+                        .frame(width: 152, alignment: .leading)
                     HStack {
                         TextField("BLASTDB folder for the optional additional database", text: $model.configuration.igBlast.additionalDatabaseDirectory)
                             .textFieldStyle(.roundedBorder)
@@ -4308,7 +4401,7 @@ struct RunBlastView: View {
                     }
                 }
                 GridRow {
-                    Color.clear.frame(width: 190, height: 0)
+                    Color.clear.frame(width: 152, height: 0)
                     Text("The V database is required. D, J, C, auxiliary data, and an additional search database can be supplied when your IgBLAST release or assay needs them.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -4451,7 +4544,7 @@ struct RunBlastView: View {
                 ProgressView(value: progress.stage == .finished ? 1 : 0)
             }
 
-            HStack(spacing: 16) {
+            HStack(spacing: 12) {
                 SummaryMetric(label: "Query", value: queryLengthLabel(progress.queryLength))
                 SummaryMetric(label: "Database", value: progress.database.isEmpty ? "--" : progress.database)
                 SummaryMetric(label: "Output", value: byteLabel(progress.outputBytes))
@@ -4712,21 +4805,15 @@ struct ParameterEditorView: View {
             let groupOptions = BlastParameterCatalog.options(for: program).filter { $0.group == group }
             if !groupOptions.isEmpty {
                 Panel(title: group, systemImage: icon(for: group)) {
-                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
                         ForEach(groupOptions) { option in
                             GridRow {
                                 Text(option.title)
-                                    .frame(width: 190, alignment: .leading)
+                                    .frame(width: 168, alignment: .leading)
+                                    .help(option.help)
                                 control(for: option)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            if !option.help.isEmpty {
-                                GridRow {
-                                    Color.clear.frame(width: 190, height: 0)
-                                    Text(option.help)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
+                                    .help(option.help)
                             }
                         }
                     }
@@ -4797,10 +4884,12 @@ struct ProgramChoiceButton: View {
                 .minimumScaleFactor(0.8)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 6)
+                .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
         .foregroundStyle(isSelected ? .white : .primary)
         .background(isSelected ? Color.accentColor : Color(nsColor: .controlColor))
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -4868,7 +4957,7 @@ struct SequenceTextEditor: View {
                     .allowsHitTesting(false)
             }
         }
-        .frame(minHeight: 160)
+        .frame(minHeight: 132)
     }
 }
 
@@ -4997,17 +5086,17 @@ struct RNASeqView: View {
             GeometryReader { proxy in
                 if proxy.size.width < 1050 {
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 12) {
                             mainColumn
                             sideColumn
                         }
-                        .padding(20)
+                        .padding(16)
                     }
                 } else {
                     HStack(spacing: 0) {
                         ScrollView {
                             mainColumn
-                                .padding(20)
+                                .padding(16)
                         }
                         .frame(minWidth: 0, maxWidth: .infinity)
 
@@ -5015,7 +5104,7 @@ struct RNASeqView: View {
 
                         ScrollView {
                             sideColumn
-                                .padding(20)
+                                .padding(16)
                         }
                         .frame(width: min(max(proxy.size.width * 0.38, 420), 620))
                     }
@@ -5025,7 +5114,7 @@ struct RNASeqView: View {
     }
 
     private var mainColumn: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
             inputPanel
             searchPanel
             outputSpecPanel
@@ -5135,11 +5224,11 @@ struct RNASeqView: View {
                 .help("Choose the BLASTDB directory.")
             }
 
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 7) {
                 if model.rnaSeqConfiguration.program == .blastn {
                     GridRow {
                         Text("BLASTN task")
-                            .frame(width: 150, alignment: .leading)
+                            .frame(width: 130, alignment: .leading)
                         Picker("BLASTN task", selection: $model.rnaSeqConfiguration.blastnTask) {
                             Text("blastn").tag("blastn")
                             Text("megablast").tag("megablast")
@@ -5150,19 +5239,19 @@ struct RNASeqView: View {
                 }
                 GridRow {
                     Text("E-value")
-                        .frame(width: 150, alignment: .leading)
+                        .frame(width: 130, alignment: .leading)
                     TextField("1e-5", text: $model.rnaSeqConfiguration.evalue)
                         .textFieldStyle(.roundedBorder)
                 }
                 GridRow {
                     Text("Max hits/read")
-                        .frame(width: 150, alignment: .leading)
+                        .frame(width: 130, alignment: .leading)
                     TextField("10", text: $model.rnaSeqConfiguration.maxTargetSequences)
                         .textFieldStyle(.roundedBorder)
                 }
                 GridRow {
                     Text("CPU threads")
-                        .frame(width: 150, alignment: .leading)
+                        .frame(width: 130, alignment: .leading)
                     TextField("4", text: $model.rnaSeqConfiguration.numThreads)
                         .textFieldStyle(.roundedBorder)
                 }
@@ -5241,7 +5330,7 @@ struct RNASeqView: View {
                 ProgressView(value: 0)
             }
 
-            HStack(spacing: 16) {
+            HStack(spacing: 12) {
                 SummaryMetric(label: "Input", value: byteLabel(progress.totalInputBytes))
                 SummaryMetric(label: "Processed", value: byteLabel(progress.processedInputBytes))
                 SummaryMetric(label: "Reads", value: countLabel(progress.convertedReads))
@@ -5326,6 +5415,419 @@ struct RNASeqView: View {
     }
 }
 
+struct SequenceToolsView: View {
+    @EnvironmentObject private var model: AppModel
+
+    private var isProteinTool: Bool {
+        model.sequenceTool == .protParam || model.sequenceTool == .backTranslate
+    }
+    private var cleanedInput: String {
+        isProteinTool ? SequenceTools.cleanProtein(model.sequenceInput) : SequenceTools.cleanNucleotides(model.sequenceInput)
+    }
+    private var geneticCode: GeneticCodeTable { .table(id: model.sequenceGeneticCodeID) }
+    private var codonUsage: CodonUsageTable {
+        CodonUsageTable.all.first { $0.id == model.sequenceCodonUsageID } ?? .human
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            toolbar
+            Divider()
+            GeometryReader { proxy in
+                if proxy.size.width < 1050 {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            inputPanel
+                            outputPanel
+                        }
+                        .padding(16)
+                    }
+                } else {
+                    HStack(spacing: 0) {
+                        ScrollView { inputPanel.padding(16) }
+                            .frame(width: min(max(proxy.size.width * 0.40, 380), 560))
+                        Divider()
+                        ScrollView { outputPanel.padding(16) }
+                            .frame(minWidth: 0, maxWidth: .infinity)
+                    }
+                }
+            }
+        }
+    }
+
+    private var toolbar: some View {
+        HStack(spacing: 12) {
+            Picker("Tool", selection: $model.sequenceTool) {
+                ForEach(SequenceToolKind.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .fixedSize()
+
+            if model.sequenceTool == .translate {
+                Picker("Genetic code", selection: $model.sequenceGeneticCodeID) {
+                    ForEach(GeneticCodeTable.all) { Text($0.displayName).tag($0.id) }
+                }
+                .frame(maxWidth: 340)
+            } else if model.sequenceTool == .backTranslate {
+                Picker("Codon usage", selection: $model.sequenceCodonUsageID) {
+                    ForEach(CodonUsageTable.all) { Text($0.name).tag($0.id) }
+                }
+                .frame(maxWidth: 260)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(.regularMaterial)
+    }
+
+    // MARK: Input
+
+    private var inputPanel: some View {
+        Panel(title: isProteinTool ? "Protein Input" : "Nucleotide Input", systemImage: "square.and.pencil") {
+            HStack(spacing: 8) {
+                Button {
+                    if let path = OpenPanel.chooseFile(allowedExtensions: ["fa", "fasta", "faa", "fna", "fas", "txt", "seq"]),
+                       let contents = try? String(contentsOfFile: path, encoding: .utf8) {
+                        model.sequenceInput = contents
+                    }
+                } label: {
+                    Label("Load FASTA", systemImage: "folder")
+                }
+                Button {
+                    let query = model.configuration.queryText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !query.isEmpty {
+                        model.sequenceInput = model.configuration.queryText
+                    } else if let contents = try? String(contentsOfFile: model.configuration.queryFilePath, encoding: .utf8) {
+                        model.sequenceInput = contents
+                    }
+                } label: {
+                    Label("From Query", systemImage: "arrow.down.doc")
+                }
+                Button {
+                    model.sequenceInput = ""
+                } label: {
+                    Label("Clear", systemImage: "xmark.circle")
+                }
+                .disabled(model.sequenceInput.isEmpty)
+                Spacer()
+                Text("\(cleanedInput.count.formatted()) \(isProteinTool ? "aa" : "nt")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .controlSize(.small)
+
+            SequenceTextEditor(
+                text: $model.sequenceInput,
+                placeholder: isProteinTool
+                    ? "Paste a protein sequence or FASTA (single-letter amino acids)"
+                    : "Paste a DNA/RNA sequence or FASTA"
+            )
+        }
+    }
+
+    // MARK: Output
+
+    @ViewBuilder
+    private var outputPanel: some View {
+        if cleanedInput.isEmpty {
+            Panel(title: model.sequenceTool.rawValue, systemImage: model.sequenceTool.systemImage) {
+                ContentUnavailableView(
+                    isProteinTool ? "Enter a protein sequence" : "Enter a nucleotide sequence",
+                    systemImage: model.sequenceTool.systemImage,
+                    description: Text("Results update as you type.")
+                )
+                .frame(minHeight: 220)
+            }
+        } else {
+            switch model.sequenceTool {
+            case .translate: translateOutput
+            case .reverseComplement: reverseComplementOutput
+            case .backTranslate: backTranslateOutput
+            case .protParam: protParamOutput
+            }
+        }
+    }
+
+    private var translateOutput: some View {
+        let frames = SequenceTools.sixFrameTranslation(model.sequenceInput, code: geneticCode)
+        let orfs = SequenceTools.findORFs(model.sequenceInput, code: geneticCode, minLength: 20)
+        return VStack(alignment: .leading, spacing: 12) {
+            Panel(title: "Six-Frame Translation", systemImage: "arrow.right.square") {
+                Text("Genetic code: \(geneticCode.displayName). Stops shown in red, Met in green.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(frames) { frame in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            Text(frame.label)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            actionMenu(for: frame.protein, defaultName: frame.label)
+                        }
+                        styledProtein(frame.protein)
+                            .font(.system(.callout, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                            .background(Color(nsColor: .textBackgroundColor))
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    if frame.frame != -3 { Divider() }
+                }
+            }
+
+            Panel(title: "Open Reading Frames", systemImage: "flag") {
+                Text("Met-to-stop ORFs ≥ 20 aa across all six frames, longest first.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if orfs.isEmpty {
+                    Text("No ORFs ≥ 20 aa found.")
+                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                } else {
+                    ForEach(orfs.prefix(30)) { orf in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 8) {
+                                Text(orf.frame > 0 ? "5'3' F\(orf.frame)" : "3'5' F\(abs(orf.frame))")
+                                    .font(.caption.weight(.semibold))
+                                Text("nt \(orf.startNucleotide.formatted())–\(orf.endNucleotide.formatted())")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text("\(orf.length.formatted()) aa")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                actionMenu(for: orf.peptide, defaultName: "ORF \(orf.startNucleotide)-\(orf.endNucleotide)")
+                            }
+                            Text(orf.peptide)
+                                .font(.system(.caption2, design: .monospaced))
+                                .lineLimit(2)
+                                .truncationMode(.tail)
+                                .textSelection(.enabled)
+                        }
+                        if orf.id != orfs.prefix(30).last?.id { Divider() }
+                    }
+                    if orfs.count > 30 {
+                        Text("+ \(orfs.count - 30) more ORFs")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private var reverseComplementOutput: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sequenceResultPanel(title: "Reverse Complement", systemImage: "arrow.left.and.right", sequence: SequenceTools.reverseComplement(model.sequenceInput))
+            sequenceResultPanel(title: "Complement", systemImage: "equal", sequence: SequenceTools.complement(model.sequenceInput))
+            sequenceResultPanel(title: "Reverse", systemImage: "arrow.uturn.left", sequence: SequenceTools.reverse(model.sequenceInput))
+        }
+    }
+
+    private var backTranslateOutput: some View {
+        let dna = SequenceTools.backTranslate(model.sequenceInput, usage: codonUsage)
+        return VStack(alignment: .leading, spacing: 12) {
+            sequenceResultPanel(title: "Back-translation", systemImage: "arrow.uturn.backward.square", sequence: dna, isNucleotide: true)
+            Panel(title: "About", systemImage: "info.circle") {
+                Text("Reverse translation is ambiguous. This uses the single most-frequent codon per residue for \(codonUsage.name), suitable as a starting point for gene synthesis — not a recovery of the original coding sequence.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func sequenceResultPanel(title: String, systemImage: String, sequence: String, isNucleotide: Bool = true) -> some View {
+        Panel(title: title, systemImage: systemImage) {
+            HStack(spacing: 8) {
+                Text("\(sequence.count.formatted()) \(isNucleotide ? "nt" : "aa")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                actionMenu(for: sequence, defaultName: title, isNucleotide: isNucleotide)
+            }
+            .controlSize(.small)
+            Text(formatBlocks(sequence).isEmpty ? "—" : formatBlocks(sequence))
+                .font(.system(.callout, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+    }
+
+    // MARK: ProtParam
+
+    @ViewBuilder
+    private var protParamOutput: some View {
+        if let r = ProtParam.analyze(model.sequenceInput) {
+            VStack(alignment: .leading, spacing: 12) {
+                Panel(title: "Summary", systemImage: "atom") {
+                    HStack(spacing: 16) {
+                        SummaryMetric(label: "Residues", value: r.residueCount.formatted())
+                        SummaryMetric(label: "Mol. weight", value: String(format: "%.2f", r.molecularWeight))
+                        SummaryMetric(label: "Theoretical pI", value: String(format: "%.2f", r.theoreticalPI))
+                        SummaryMetric(label: "GRAVY", value: String(format: "%.3f", r.gravy))
+                    }
+                    keyValue("Formula", r.formula, mono: true)
+                    keyValue("Total atoms", r.totalAtoms.formatted())
+                    keyValue("Negatively charged (Asp + Glu)", r.negativeResidueCount.formatted())
+                    keyValue("Positively charged (Arg + Lys)", r.positiveResidueCount.formatted())
+                }
+
+                Panel(title: "Extinction Coefficients (280 nm)", systemImage: "sun.max") {
+                    Text("Computed from \(r.tyrosineCount) Tyr, \(r.tryptophanCount) Trp, \(r.cysteineCount) Cys (Edelhoch / Gill & von Hippel).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    keyValue("Assuming all Cys form cystines", "\(r.extinctionCystine.formatted()) M⁻¹cm⁻¹   ·   Abs 0.1% = \(String(format: "%.3f", r.abs01Cystine))", mono: true)
+                    keyValue("Assuming all Cys reduced", "\(r.extinctionReduced.formatted()) M⁻¹cm⁻¹   ·   Abs 0.1% = \(String(format: "%.3f", r.abs01Reduced))", mono: true)
+                }
+
+                Panel(title: "Stability & Hydropathy", systemImage: "gauge.with.dots.needle.bottom.50percent") {
+                    keyValue("Instability index", String(format: "%.2f", r.instabilityIndex) + (r.isStable ? "  (stable)" : "  (unstable)"))
+                    keyValue("Aliphatic index", String(format: "%.2f", r.aliphaticIndex))
+                    keyValue("GRAVY", String(format: "%.3f", r.gravy))
+                }
+
+                Panel(title: "Estimated Half-life", systemImage: "clock") {
+                    Text("N-terminal residue: \(ProtParam.aaNames[r.nTerminal] ?? String(r.nTerminal)) (\(String(r.nTerminal)))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    keyValue("Mammalian (reticulocytes, in vitro)", r.halfLifeMammalian)
+                    keyValue("Yeast (in vivo)", r.halfLifeYeast)
+                    keyValue("E. coli (in vivo)", r.halfLifeEcoli)
+                }
+
+                Panel(title: "Amino Acid Composition", systemImage: "chart.bar") {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 6)], alignment: .leading, spacing: 4) {
+                        ForEach(r.composition) { entry in
+                            HStack(spacing: 6) {
+                                Text("\(entry.name) (\(String(entry.code)))")
+                                    .font(.caption)
+                                Spacer()
+                                Text(entry.count.formatted())
+                                    .font(.system(.caption, design: .monospaced))
+                                Text(String(format: "%.1f%%", entry.percent))
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 46, alignment: .trailing)
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            Panel(title: "ProtParam", systemImage: "atom") {
+                ContentUnavailableView(
+                    "No standard residues found",
+                    systemImage: "atom",
+                    description: Text("Paste a protein sequence using single-letter amino-acid codes.")
+                )
+                .frame(minHeight: 200)
+            }
+        }
+    }
+
+    // MARK: Helpers
+
+    private func keyValue(_ key: String, _ value: String, mono: Bool = false) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(key)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(width: 220, alignment: .leading)
+            Text(value)
+                .font(mono ? .system(.callout, design: .monospaced) : .callout)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private func actionMenu(for sequence: String, defaultName: String, isNucleotide: Bool = false) -> some View {
+        HStack(spacing: 6) {
+            Button {
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(sequence, forType: .string)
+            } label: {
+                Label("Copy", systemImage: "doc.on.doc")
+            }
+            Button {
+                model.useSequenceAsQuery(fastaWrapped(defaultName, sequence))
+            } label: {
+                Label("Use as query", systemImage: "play.circle")
+            }
+            if !isNucleotide {
+                Button {
+                    model.openSequenceTool(.protParam, with: sequence)
+                } label: {
+                    Label("ProtParam", systemImage: "atom")
+                }
+            }
+        }
+        .buttonStyle(.borderless)
+        .controlSize(.small)
+        .labelStyle(.iconOnly)
+    }
+
+    private func fastaWrapped(_ name: String, _ sequence: String) -> String {
+        ">\(name)\n\(sequence)"
+    }
+
+    private func formatBlocks(_ s: String, lineLength: Int = 60, group: Int = 10) -> String {
+        guard !s.isEmpty else { return "" }
+        let chars = Array(s)
+        var lines: [String] = []
+        var i = 0
+        while i < chars.count {
+            let lineEnd = min(i + lineLength, chars.count)
+            var line = ""
+            var j = i
+            while j < lineEnd {
+                let groupEnd = min(j + group, lineEnd)
+                line += String(chars[j..<groupEnd])
+                if groupEnd < lineEnd { line += " " }
+                j = groupEnd
+            }
+            lines.append(line)
+            i += lineLength
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func styledProtein(_ s: String, lineLength: Int = 60) -> Text {
+        guard !s.isEmpty else { return Text("—").foregroundColor(.secondary) }
+        var attr = AttributedString()
+        var buffer = ""
+        var bufferColor: Color? = nil
+        func flush() {
+            guard !buffer.isEmpty else { return }
+            var piece = AttributedString(buffer)
+            if let color = bufferColor { piece.foregroundColor = color }
+            attr.append(piece)
+            buffer.removeAll(keepingCapacity: true)
+        }
+        var count = 0
+        for ch in s {
+            let color: Color? = ch == "*" ? .red : (ch == "M" ? .green : nil)
+            if color != bufferColor { flush(); bufferColor = color }
+            buffer.append(ch)
+            count += 1
+            if count % lineLength == 0 {
+                flush()
+                bufferColor = nil
+                attr.append(AttributedString("\n"))
+            }
+        }
+        flush()
+        return Text(attr)
+    }
+}
+
 struct DatabasesView: View {
     @EnvironmentObject private var model: AppModel
     var showsHeader = true
@@ -5373,23 +5875,23 @@ struct DatabasesView: View {
             GeometryReader { proxy in
                 if proxy.size.width < 1050 {
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 12) {
                             databaseMainColumn
                             databaseSideColumn
                         }
-                        .padding(20)
+                        .padding(16)
                     }
                 } else {
                     HStack(spacing: 0) {
                         ScrollView {
                             databaseMainColumn
-                                .padding(20)
+                                .padding(16)
                         }
                         .frame(minWidth: 0, maxWidth: .infinity)
 
                         ScrollView {
                             databaseSideColumn
-                                .padding(20)
+                                .padding(16)
                         }
                         .frame(width: min(max(proxy.size.width * 0.38, 420), 620))
                     }
@@ -5399,7 +5901,7 @@ struct DatabasesView: View {
     }
 
     private var databaseMainColumn: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             Panel(title: "Storage", systemImage: "internaldrive") {
                 HStack {
                     TextField("Database directory", text: $model.preferences.databaseDirectory)
@@ -5426,7 +5928,7 @@ struct DatabasesView: View {
     }
 
     private var databaseSideColumn: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             missingCatalogPanel
             customDatabasePanel
             Panel(title: "Database Log", systemImage: "text.bubble") {
@@ -5573,7 +6075,7 @@ struct DatabasesView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                HStack(spacing: 16) {
+                HStack(spacing: 12) {
                     SummaryMetric(label: "Observed", value: byteLabel(progress.observedCompressedBytes))
                     SummaryMetric(label: "This Run", value: byteLabel(progress.addedCompressedBytes))
                     SummaryMetric(label: "Speed", value: speedLabel(progress.bytesPerSecond))
@@ -5611,7 +6113,7 @@ struct DatabasesView: View {
 
     private var installedSummaryPanel: some View {
         Panel(title: "Installed Databases", systemImage: "checkmark.seal") {
-            HStack(spacing: 16) {
+            HStack(spacing: 12) {
                 SummaryMetric(label: "Databases", value: "\(installedNames.count)")
                 SummaryMetric(label: "Files", value: "\(model.installedDatabaseSummary.fileCount)")
                 SummaryMetric(label: "Storage", value: installedSizeLabel)
@@ -5765,16 +6267,16 @@ struct SummaryMetric: View {
     var value: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 1) {
             Text(value)
-                .font(.title3.bold())
+                .font(.headline)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
             Text(label)
-                .font(.caption)
+                .font(.caption2)
                 .foregroundStyle(.secondary)
         }
-        .frame(minWidth: 94, alignment: .leading)
+        .frame(minWidth: 76, alignment: .leading)
     }
 }
 
@@ -5798,7 +6300,7 @@ struct ToolsView: View {
             }
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 12) {
                     Panel(title: "Location", systemImage: "folder.badge.gearshape") {
                         HStack {
                             TextField("Optional tool bin directory", text: $model.preferences.blastBinDirectory)
@@ -5824,7 +6326,7 @@ struct ToolsView: View {
                     }
 
                     Panel(title: "Suite Status", systemImage: "checklist") {
-                        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 7) {
                             GridRow {
                                 Text("Tool").bold()
                                 Text("Status").bold()
@@ -5862,7 +6364,7 @@ struct ToolsView: View {
                         Link("NCBI BLAST database downloads", destination: URL(string: "https://www.ncbi.nlm.nih.gov/books/NBK569850/")!)
                     }
                 }
-                .padding(20)
+                .padding(16)
             }
         }
     }
@@ -5899,7 +6401,7 @@ struct ResultsView: View {
 
             ScrollView {
                 selectedResult
-                    .padding(20)
+                    .padding(16)
             }
             .frame(maxWidth: .infinity)
         }
@@ -5915,7 +6417,7 @@ struct ResultsView: View {
     @ViewBuilder
     private var selectedResult: some View {
         if let selectedJob {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 12) {
                 resultJobHeader(selectedJob)
                 if let report = model.selectedResultReport {
                     BlastResultReportView(
@@ -5952,7 +6454,7 @@ struct ResultsView: View {
 
     private func resultJobHeader(_ job: BlastJobRecord) -> some View {
         Panel(title: job.displayTitle, systemImage: "doc.text") {
-            HStack(alignment: .firstTextBaseline, spacing: 16) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("\(job.kind.rawValue) · \(job.program.displayName)")
                         .font(.callout.weight(.semibold))
@@ -5990,7 +6492,7 @@ struct ResultsView: View {
                 ResultStatusBadge(job: job)
             }
 
-            HStack(spacing: 16) {
+            HStack(spacing: 12) {
                 SummaryMetric(label: "Database", value: job.database.isEmpty ? "--" : job.database)
                 SummaryMetric(label: "Hits", value: job.noHits ? "0" : job.hitCount.map { $0.formatted() } ?? "--")
                 SummaryMetric(label: "Output", value: ByteCountFormatter.string(fromByteCount: job.outputBytes, countStyle: .file))
@@ -6031,51 +6533,47 @@ struct ResultJobRow: View {
     var job: BlastJobRecord
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
                 Image(systemName: statusImage)
+                    .font(.caption)
                     .foregroundStyle(statusColor)
                 Text(job.displayTitle)
-                    .font(.headline)
+                    .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
+                if !job.linkedGroup.isEmpty {
+                    Image(systemName: "link")
+                        .font(.caption2)
+                        .foregroundStyle(.blue)
+                }
                 Spacer()
                 Text(job.date, style: .time)
-                    .font(.caption)
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
             }
 
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Text(job.program.displayName)
-                    .font(.caption.weight(.semibold))
-                if !job.linkedGroup.isEmpty {
-                    Label("Linked", systemImage: "link")
-                        .font(.caption)
-                        .foregroundStyle(.blue)
-                }
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.primary)
                 Text(job.database.isEmpty ? job.kind.rawValue : job.database)
-                    .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
+            .font(.caption2)
 
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Text(job.status.rawValue)
                     .foregroundStyle(statusColor)
                 Text(job.kind == .multipleAlignment ? "Alignment" : (job.noHits ? "No hits" : hitLabel))
                 Text(ByteCountFormatter.string(fromByteCount: job.outputBytes, countStyle: .file))
                 Text("\(job.reservedThreads) CPU")
             }
-            .font(.caption)
+            .font(.caption2)
             .foregroundStyle(.secondary)
-
-            Text(URL(fileURLWithPath: job.outputPath).lastPathComponent)
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
         }
-        .padding(.vertical, 5)
+        .padding(.vertical, 3)
     }
 
     private var hitLabel: String {
@@ -6372,7 +6870,7 @@ struct BlastResultReportView: View {
                             .font(.headline)
                             .lineLimit(2)
 
-                        HStack(spacing: 14) {
+                        HStack(spacing: 12) {
                             metricLabel("Score", alignment.scoreBits)
                             metricLabel("Expect", alignment.eValue)
                             metricLabel("Identities", alignment.identities)
@@ -6759,18 +7257,19 @@ struct HeaderBar<Trailing: View>: View {
     @ViewBuilder var trailing: () -> Trailing
 
     var body: some View {
-        HStack(alignment: .center, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                    .font(.title2.bold())
+                    .font(.title3.bold())
                 Text(subtitle)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
             trailing()
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 9)
         .background(.regularMaterial)
     }
 }
@@ -6781,12 +7280,13 @@ struct Panel<Content: View>: View {
     @ViewBuilder var content: () -> Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
             Label(title, systemImage: systemImage)
-                .font(.headline)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
             content()
         }
-        .padding(14)
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
